@@ -318,6 +318,44 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
   return JSON.stringify(context);
 }
 
+// Bound the site-assessment reasoning prompt the same way fitPlanReasoningContext
+// bounds the floor-plan one. Unbounded observedEquipmentGuidance (up to 8 types x
+// several NBC results each, with page-text snippets) was the "prompt too big"
+// stall reported after the CLIPSeg step: gpt-oss-120b would sit far longer than
+// expected processing a context that dwarfed the actual detections it described.
+function fitReasonContext(context, maxChars = 10_000) {
+  let serialized = JSON.stringify(context);
+  if (serialized.length <= maxChars) return serialized;
+
+  // Trim guidance depth first — it's supporting citation material, not evidence.
+  context.observedEquipmentGuidance = (context.observedEquipmentGuidance || []).map((group) => ({
+    ...group,
+    results: (group.results || []).slice(0, 2).map((result) => ({
+      ...result,
+      rationale: String(result.rationale || '').slice(0, 120),
+      snippet: String(result.snippet || '').slice(0, 160),
+      relations: undefined,
+    })),
+  }));
+  serialized = JSON.stringify(context);
+  if (serialized.length <= maxChars) return serialized;
+
+  // Then reduce breadth: fewer guided types, fewer documents.
+  context.observedEquipmentGuidance = context.observedEquipmentGuidance.slice(0, 4);
+  context.documents = (context.documents || []).slice(0, 10);
+  serialized = JSON.stringify(context);
+  if (serialized.length <= maxChars) return serialized;
+
+  // Final bounded form: keep every detected item (that's the actual evidence)
+  // but drop citation guidance to a single top result per type.
+  context.observedEquipmentGuidance = context.observedEquipmentGuidance.map((group) => ({
+    type: group.type,
+    results: (group.results || []).slice(0, 1),
+  }));
+  context.documents = (context.documents || []).slice(0, 5);
+  return JSON.stringify(context);
+}
+
 function compactPlanForReasoning(converted) {
   const topology = converted?.topology || {};
   const advisory = converted?.visionAdvisory || {};
@@ -536,10 +574,10 @@ async function groqReason(request, env, cors, apiKey) {
   const evidenceContext = sanitiseEvidenceContext(body.evidenceContext);
   const observedTypes = [...new Set(detected.map((item) => String(item?.type || '')))]
     .filter((type) => VISUAL_GUIDANCE_QUERIES[type])
-    .slice(0, 12);
+    .slice(0, 8);
   const observedGuidance = await Promise.all(observedTypes.map(async (type) => {
     try {
-      const result = await queryNbc(env, VISUAL_GUIDANCE_QUERIES[type], { k: 5, hops: 1 });
+      const result = await queryNbc(env, VISUAL_GUIDANCE_QUERIES[type], { k: 3, hops: 1 });
       return { type, results: result.results };
     } catch (error) {
       return { type, error: 'NBCS guidance lookup failed' };
@@ -570,7 +608,7 @@ async function groqReason(request, env, cors, apiKey) {
 
   const messages = [
     { role: 'system', content: REASON_SYSTEM },
-    { role: 'user', content: JSON.stringify({
+    { role: 'user', content: fitReasonContext({
       buildingProfile: profile,
       evidenceContext,
       detectedEquipment: detected,

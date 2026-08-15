@@ -23,6 +23,10 @@
   const MODEL_ID = 'Xenova/clipseg-rd64-refined';
   const THRESHOLD = 0.4; // sigmoid prob above which a pixel is "equipment"
   const MIN_BLOB_PX = 12; // ignore specks when counting instances (on 64x64)
+  // CLIPSeg's own processor resizes to a fixed model input anyway (352x352),
+  // so decoding/resizing a full 12MP phone photo before that only burns time.
+  // Cap the longest side before handing the image to the processor.
+  const MAX_INPUT_SIDE = 640;
 
   let _pipe = null; // { processor, model, tensorOps }
   let _loading = null;
@@ -100,6 +104,30 @@
     return 1 / (1 + Math.exp(-x));
   }
 
+  // Downscale via canvas so decode + the processor's own resize work on a
+  // bounded number of pixels regardless of the source photo's resolution.
+  function downscale(dataUrl) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const longest = Math.max(img.width, img.height);
+        if (longest <= MAX_INPUT_SIDE) {
+          resolve(dataUrl);
+          return;
+        }
+        const scale = MAX_INPUT_SIDE / longest;
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.85));
+      };
+      img.onerror = () => resolve(dataUrl); // fall back to the original on decode failure
+      img.src = dataUrl;
+    });
+  }
+
   async function fsDetectEquipment(dataUrl, promptsJson) {
     if (!fsClipsegSupported()) return '[]';
     let prompts;
@@ -120,7 +148,8 @@
     }
 
     try {
-      const image = await pipe.RawImage.fromURL(dataUrl);
+      const scaledUrl = await downscale(dataUrl);
+      const image = await pipe.RawImage.fromURL(scaledUrl);
       // One image, N text prompts → N segmentation maps.
       const inputs = await pipe.processor(image, texts);
       const { logits } = await pipe.model(inputs);
