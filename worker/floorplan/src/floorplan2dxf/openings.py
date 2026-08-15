@@ -175,29 +175,27 @@ def _select_perimeter(
     alone picks them. A wall is distinguished by being densely inked across its
     band, which a dimension line — a single hairline — is not.
     """
-    # TODO(next): replace this ranking with arrowhead rejection. Dimension lines
-    # are the only lines in an architectural drawing that carry arrowheads (or
-    # tick marks) at their ends — walls never do. Excluding those makes the
-    # perimeter simply "the outermost remaining line per side", with no scoring
-    # at all. The length x density ranking below is a stand-in for that and is
-    # the weak point: it still admits long interior walls and can miss an
-    # exterior wall whose trace is fragmented into short pieces.
-    scored: list[tuple[PerimeterLine, float]] = []
+    # Separate walls from dimension lines by measured thickness, then simply
+    # take the outermost wall on each side. No ranking by length or position is
+    # needed once dimension lines are excluded, which is what previously let a
+    # long interior wall win and an exterior wall be missed.
+    probe = max(4, int(round(tolerance)))
+    measured: list[tuple[PerimeterLine, float]] = []
     for line in lines:
-        covered = float(line.__dict__.get("_covered", 0.0))
-        if covered < tolerance * 2:
+        if float(line.__dict__.get("_covered", 0.0)) < tolerance * 2:
             continue
-        # Rank by total ink carried along the line, i.e. length x density. An
-        # exterior wall is both long and solidly inked; a dimension line is long
-        # but hairline, and a short thick interior stub is dense but brief, so
-        # neither outranks a real perimeter wall on the product of the two.
-        density = _line_density(line, ink)
-        if density > 0:
-            scored.append((line, covered * density))
-    if not scored:
+        thickness = measured_thickness(line, ink, probe)
+        if thickness > 0:
+            measured.append((line, thickness))
+    if not measured:
         return []
-    strongest = max(mass for _, mass in scored)
-    walls_only = [line for line, mass in scored if mass >= strongest * 0.25]
+    # The thinnest line on the drawing IS the pen width, because dimension
+    # lines are drawn at it. Walls are bands several times that. Comparing
+    # against the pen width rather than the thickest wall keeps thin exterior
+    # walls, which a max-relative threshold would discard alongside the
+    # dimension lines.
+    pen = min(thickness for _, thickness in measured)
+    walls_only = [line for line, thickness in measured if thickness >= max(3.0, pen * 2.0)]
     chosen: list[PerimeterLine] = []
     for horizontal in (True, False):
         side = sorted(
@@ -210,6 +208,43 @@ def _select_perimeter(
         if side[-1] is not side[0]:
             chosen.append(side[-1])
     return chosen
+
+
+def measured_thickness(line: PerimeterLine, ink: np.ndarray, probe: int) -> float:
+    """Median drawn thickness of a line, measured perpendicular to it.
+
+    This is what separates a wall from a dimension line. Walls are drawn as a
+    band several pixels thick and hold that thickness along their length;
+    dimension lines are hairlines, thickening only momentarily at their
+    arrowheads, so their median stays near the pen width. Taking the median
+    ignores those arrowheads and any tick marks.
+    """
+    height, width = ink.shape[:2]
+    fixed = int(round(line.fixed))
+    lo, hi = int(max(0, line.lo)), int(min((width if line.horizontal else height), line.hi))
+    if hi - lo < 2:
+        return 0.0
+    samples: list[int] = []
+    step = max(1, (hi - lo) // 40)
+    for position in range(lo, hi, step):
+        a = max(0, fixed - probe)
+        b = min((height if line.horizontal else width), fixed + probe + 1)
+        strip = ink[a:b, position] if line.horizontal else ink[position, a:b]
+        if strip.size == 0:
+            continue
+        centre = min(len(strip) - 1, max(0, fixed - a))
+        if strip[centre] == 0:
+            continue  # a gap (an opening) — not evidence of thinness
+        run = 1
+        for direction in (-1, 1):
+            index = centre + direction
+            while 0 <= index < len(strip) and strip[index] > 0:
+                run += 1
+                index += direction
+        samples.append(run)
+    if not samples:
+        return 0.0
+    return float(np.median(samples))
 
 
 def _line_density(line: PerimeterLine, ink: np.ndarray) -> float:
@@ -243,7 +278,13 @@ def _detect_windows(ink: np.ndarray, walls: list[Wall], door_span: float) -> lis
         span = int(hi - lo)
         if span < max(8, int(door_span * 0.5)):
             continue
-        half = max(3, int(round(line.thickness * 0.75)))
+        # Size the sampling band from the thickness actually measured off the
+        # drawing, not the value carried on the wall record — the latter comes
+        # from fragmented trace segments and understates a solid exterior wall,
+        # which makes the band too narrow to see the hollow window interior.
+        probe = max(4, int(round(max(6.0, door_span * 0.5))))
+        drawn = measured_thickness(line, ink, probe)
+        half = max(3, int(round(max(drawn, line.thickness) * 0.6)))
         fixed_i = int(round(fixed))
         a, b = max(0, fixed_i - half), min((height if horizontal else width), fixed_i + half + 1)
         if b - a < 2:
