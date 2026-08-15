@@ -13,6 +13,16 @@
 
 import { queryNbc } from './nbc_graph.js';
 
+// Compatibility tombstone for the short-lived Cloudflare Containers attempt.
+// Existing Durable Object metadata still references this export. Keeping the
+// class avoids an irreversible delete migration; no binding routes requests to
+// it and it stores no state.
+export class FloorplanContainer {
+  async fetch() {
+    return json({ error: 'legacy floor-plan container retired' }, 410);
+  }
+}
+
 const GROQ_BASE = 'https://api.groq.com/openai/v1';
 const MAX_JSON_BYTES = 48_000;
 const MAX_VISION_BYTES = 22 * 1024 * 1024; // 5 images * ~4MB + JSON overhead
