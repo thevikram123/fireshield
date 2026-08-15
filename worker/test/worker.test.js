@@ -64,8 +64,16 @@ test('floorplan conversion calls protected Qwen service then GPT-OSS NBCS assess
       processorRequest = { url: String(url), options };
       return Response.json({
         buildingProfile: { occupancy: 'Business', buildingHeightM: 12 },
-        topology: { units: 'mm', rooms: [], room_graph: { nodes: [], edges: [] } },
+        topology: {
+          units: 'mm',
+          rooms: Array.from({ length: 100 }, (_, i) => ({
+            id: `room-${i}`, type: 'OFFICE', label: `Office ${i}`,
+            boundary: Array.from({ length: 100 }, (_, p) => [p, p + i]),
+          })),
+          room_graph: { nodes: [], edges: [] },
+        },
         guidance: { reviewStatus: 'approved' }, metrics: { rooms: 0 }, artifacts: {},
+        oversizedArtifactMustNotReachGroq: 'x'.repeat(100_000),
       });
     }
     groqPayload = JSON.parse(options.body);
@@ -98,6 +106,11 @@ test('floorplan conversion calls protected Qwen service then GPT-OSS NBCS assess
   assert.equal(body.compliance.findings[0].status, 'cannot_verify');
   assert.equal(groqPayload.model, 'openai/gpt-oss-120b');
   assert.match(groqPayload.messages[1].content, /Business/);
+  assert.ok(groqPayload.messages[1].content.length <= 12_000);
+  assert.doesNotMatch(groqPayload.messages[1].content, /oversizedArtifactMustNotReachGroq/);
+  assert.equal(groqPayload.response_format.type, 'json_schema');
+  assert.equal(groqPayload.response_format.json_schema.strict, true);
+  assert.equal(groqPayload.reasoning_effort, 'low');
 });
 
 test('chat fails closed when the reasoning limiter is missing', async () => {

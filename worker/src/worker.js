@@ -169,23 +169,34 @@ async function convertFloorplan(request, env, cors, groqKey) {
 async function assessFloorplan(converted, env, apiKey) {
   const guidance = await Promise.all(PLAN_GUIDANCE_QUERIES.map(async (question) => {
     try {
-      const result = await queryNbc(env, question, { k: 5, hops: 1 });
-      return { question, results: result.results };
+      const result = await queryNbc(env, question, { k: 3, hops: 1 });
+      return {
+        question,
+        results: result.results.map((item) => ({
+          id: String(item.id || '').slice(0, 100),
+          label: String(item.label || '').slice(0, 180),
+          page: Number.isFinite(Number(item.page)) ? Number(item.page) : null,
+          rationale: String(item.rationale || '').slice(0, 240),
+          snippet: String(item.snippet || '').slice(0, 300),
+        })),
+      };
     } catch {
       return { question, error: 'NBCS guidance lookup failed' };
     }
   }));
   const plan = compactPlanForReasoning(converted);
+  const reasoningContext = fitPlanReasoningContext(plan, guidance);
   const data = await callGroq(apiKey, {
     model: env.GROQ_REASON_MODEL,
     messages: [
       { role: 'system', content: PLAN_REASON_SYSTEM },
-      { role: 'user', content: JSON.stringify({ plan, nbcsGuidance: guidance }).slice(0, 30000) },
+      { role: 'user', content: reasoningContext },
     ],
     temperature: 0.2,
-    max_completion_tokens: 2200,
+    max_completion_tokens: 1600,
+    reasoning_effort: 'low',
     include_reasoning: false,
-    response_format: { type: 'json_object' },
+    response_format: PLAN_RESPONSE_FORMAT,
   });
   if (data.error) return data;
   const value = safeJson(data.json?.choices?.[0]?.message?.content);
@@ -195,21 +206,116 @@ async function assessFloorplan(converted, env, apiKey) {
   return { value };
 }
 
+function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
+  const context = { plan, nbcsGuidance: guidance };
+  let serialized = JSON.stringify(context);
+  if (serialized.length <= maxChars) return serialized;
+
+  // Preserve measurements and citations first; polygon detail and lower-ranked
+  // retrieval hits are reduced before whole entities are omitted.
+  context.plan.rooms = context.plan.rooms.map(({ boundary, ...room }) => room);
+  context.plan.exteriorBoundary = context.plan.exteriorBoundary.slice(0, 20);
+  context.plan.roomGraph.nodes = context.plan.roomGraph.nodes.slice(0, 50);
+  context.plan.roomGraph.edges = context.plan.roomGraph.edges.slice(0, 80);
+  context.nbcsGuidance = context.nbcsGuidance.map((group) => ({
+    ...group,
+    results: (group.results || []).slice(0, 2).map((result) => ({
+      ...result,
+      rationale: String(result.rationale || '').slice(0, 160),
+      snippet: String(result.snippet || '').slice(0, 220),
+    })),
+  }));
+  serialized = JSON.stringify(context);
+  if (serialized.length <= maxChars) return serialized;
+
+  const sourceCounts = {
+    rooms: context.plan.rooms.length,
+    doors: context.plan.doors.length,
+    windows: context.plan.windows.length,
+    objects: context.plan.objects.length,
+  };
+  context.plan.rooms = context.plan.rooms.slice(0, 25);
+  context.plan.doors = context.plan.doors.slice(0, 40);
+  context.plan.windows = context.plan.windows.slice(0, 40);
+  context.plan.objects = context.plan.objects.slice(0, 40);
+  context.plan.roomGraph.nodes = context.plan.roomGraph.nodes.slice(0, 25);
+  context.plan.roomGraph.edges = context.plan.roomGraph.edges.slice(0, 40);
+  context.plan.contextCoverage = {
+    sourceCounts,
+    includedCounts: {
+      rooms: context.plan.rooms.length,
+      doors: context.plan.doors.length,
+      windows: context.plan.windows.length,
+      objects: context.plan.objects.length,
+    },
+    note: 'Lower-priority entity detail omitted to stay within the Groq token budget.',
+  };
+  serialized = JSON.stringify(context);
+  if (serialized.length <= maxChars) return serialized;
+
+  // Final bounded form still carries aggregate metrics, visual-review status,
+  // coverage disclosure and the top cited result for each regulatory topic.
+  context.plan.rooms = [];
+  context.plan.doors = [];
+  context.plan.windows = [];
+  context.plan.objects = [];
+  context.plan.roomGraph = { nodes: [], edges: [] };
+  context.nbcsGuidance = context.nbcsGuidance.map((group) => ({
+    question: group.question,
+    results: (group.results || []).slice(0, 1),
+  }));
+  return JSON.stringify(context);
+}
+
 function compactPlanForReasoning(converted) {
   const topology = converted?.topology || {};
+  const point = (value) => Array.isArray(value) ? value.slice(0, 2).map(Number) : value;
   return {
-    buildingProfile: converted?.buildingProfile || {},
-    qwenReview: converted?.guidance || {},
+    buildingProfile: {
+      occupancy: String(converted?.buildingProfile?.occupancy || '').slice(0, 100),
+      buildingHeightM: Number(converted?.buildingProfile?.buildingHeightM) || null,
+      floors: Number(converted?.buildingProfile?.floors) || null,
+      floorAreaM2: Number(converted?.buildingProfile?.floorAreaM2) || null,
+      sprinklered: converted?.buildingProfile?.sprinklered === true,
+    },
+    qwenReview: {
+      reviewStatus: converted?.guidance?.reviewStatus,
+      reviewConfidence: converted?.guidance?.reviewConfidence,
+      reviewSummary: String(converted?.guidance?.reviewSummary || '').slice(0, 500),
+      discrepancies: Array.isArray(converted?.guidance?.discrepancies)
+        ? converted.guidance.discrepancies.slice(0, 10) : [],
+    },
     metrics: converted?.metrics || {},
     units: topology.units,
     mmPerPx: topology.mm_per_px,
     imageSize: topology.image_size,
-    exteriorBoundary: topology.exterior_boundary,
-    rooms: Array.isArray(topology.rooms) ? topology.rooms.slice(0, 100) : [],
-    doors: Array.isArray(topology.doors) ? topology.doors.slice(0, 150) : [],
-    windows: Array.isArray(topology.windows) ? topology.windows.slice(0, 150) : [],
-    objects: Array.isArray(topology.objects) ? topology.objects.slice(0, 150) : [],
-    roomGraph: topology.room_graph || {},
+    exteriorBoundary: Array.isArray(topology.exterior_boundary)
+      ? topology.exterior_boundary.slice(0, 60).map(point) : [],
+    rooms: Array.isArray(topology.rooms) ? topology.rooms.slice(0, 50).map((room) => ({
+      id: room.id, type: room.type, label: room.label,
+      area_mm2: room.area_mm2,
+      boundary: Array.isArray(room.boundary) ? room.boundary.slice(0, 24).map(point) : [],
+    })) : [],
+    doors: Array.isArray(topology.doors) ? topology.doors.slice(0, 80).map((door) => ({
+      id: door.id, wall_id: door.wall_id, width_mm: door.width_mm, center: point(door.center),
+    })) : [],
+    windows: Array.isArray(topology.windows) ? topology.windows.slice(0, 80).map((window) => ({
+      id: window.id, wall_id: window.wall_id, width_mm: window.width_mm, center: point(window.center),
+    })) : [],
+    objects: Array.isArray(topology.objects) ? topology.objects.slice(0, 80).map((object) => ({
+      id: object.id, type: object.type, center: point(object.center), confidence: object.confidence,
+    })) : [],
+    roomGraph: {
+      nodes: Array.isArray(topology.room_graph?.nodes) ? topology.room_graph.nodes.slice(0, 80)
+        .map((node) => typeof node === 'object' ? {
+          id: String(node.id || '').slice(0, 80), type: String(node.type || '').slice(0, 80),
+        } : String(node).slice(0, 80)) : [],
+      edges: Array.isArray(topology.room_graph?.edges) ? topology.room_graph.edges.slice(0, 120)
+        .map((edge) => typeof edge === 'object' ? {
+          source: String(edge.source || '').slice(0, 80), target: String(edge.target || '').slice(0, 80),
+          type: String(edge.type || '').slice(0, 80),
+        } : String(edge).slice(0, 160)) : [],
+    },
   };
 }
 
@@ -463,8 +569,12 @@ async function callGroq(apiKey, payload) {
   try { body = await upstream.json(); } catch { body = null; }
   if (!upstream.ok) {
     console.error(JSON.stringify({ message: 'Groq call failed', status: upstream.status, model: payload.model }));
+    const detail = body?.error && typeof body.error === 'object' ? body.error : {};
+    const code = String(detail.code || detail.type || '').slice(0, 100);
+    const message = String(detail.message || '').slice(0, 500);
+    const providerDetail = [code, message].filter(Boolean).join(': ');
     return {
-      error: `Groq call failed (${upstream.status})`,
+      error: `Groq call failed (${upstream.status})${providerDetail ? `: ${providerDetail}` : ''}`,
       status: upstream.status,
       headers: groqRateLimitHeaders(upstream.headers),
     };
@@ -533,6 +643,57 @@ const PLAN_REASON_SYSTEM =
   + '"clauseId":string,"page":number|null,"rationale":string}],'
   + '"citedClauses":[{"id":string,"title":string,"page":number}],"limitations":[string]}. '
   + 'Only assign a numeric score when enough checks are verifiable; otherwise score must be null.';
+
+const PLAN_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'fire_plan_compliance_assessment',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        planSummary: { type: 'string' },
+        score: { type: ['number', 'null'] },
+        findings: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              check: { type: 'string' },
+              status: { type: 'string', enum: ['compliant', 'gap', 'critical_gap', 'cannot_verify'] },
+              severity: { type: 'string', enum: ['minor', 'major', 'critical'] },
+              observed: { type: 'string' },
+              required: { type: 'string' },
+              measurementEvidence: { type: 'string' },
+              clauseId: { type: 'string' },
+              page: { type: ['number', 'null'] },
+              rationale: { type: 'string' },
+            },
+            required: [
+              'check', 'status', 'severity', 'observed', 'required',
+              'measurementEvidence', 'clauseId', 'page', 'rationale',
+            ],
+          },
+        },
+        citedClauses: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string' }, title: { type: 'string' }, page: { type: 'number' },
+            },
+            required: ['id', 'title', 'page'],
+          },
+        },
+        limitations: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['planSummary', 'score', 'findings', 'citedClauses', 'limitations'],
+    },
+  },
+};
 
 // ── Shared helpers (from the Cloudflare-Groq skill) ──────────────────────────
 async function readSecret(binding) {
