@@ -88,7 +88,12 @@ class QwenTopologyGuide:
         req = urllib.request.Request(
             "https://api.groq.com/openai/v1/chat/completions",
             data=body,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "FireShield-Floorplan/1.0",
+            },
             method="POST",
         )
         try:
