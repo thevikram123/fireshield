@@ -191,7 +191,13 @@ test('plan compliance can query_nbc for a specific measured condition before con
   // Tool-requesting hop, second hop, then the forced strict-schema final call.
   assert.equal(groqCalls.length, 3);
   assert.ok(groqCalls[0].tools.some((tool) => tool.function.name === 'query_nbc'));
+  // Tool-selection hops run on the light model so they don't burn the same
+  // 8000 TPM/min pool the final 120b verdict call (and any concurrent
+  // site/photo audit reasonCompliance call) draws on.
+  assert.equal(groqCalls[0].model, 'openai/gpt-oss-20b');
+  assert.equal(groqCalls[1].model, 'openai/gpt-oss-20b');
   const final = groqCalls[groqCalls.length - 1];
+  assert.equal(final.model, 'openai/gpt-oss-120b');
   assert.equal(final.tool_choice, 'none');
   assert.equal(final.response_format.type, 'json_schema');
   // The tool result (even if empty) must have round-tripped back as a tool message.

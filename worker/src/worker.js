@@ -208,9 +208,15 @@ async function assessFloorplan(converted, env, apiKey) {
     { role: 'user', content: fitPlanReasoningContext(plan, []) },
   ];
 
+  // Same split as groqReason: tool-selection hops run on gpt-oss-20b (its own
+  // TPM pool) so they don't eat into the 8000 TPM/min budget the final
+  // gpt-oss-120b verdict call below needs — and don't collide with a
+  // concurrent site/photo audit's reasonCompliance, which draws on the same
+  // 120b pool.
+  const hopModel = env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL;
   for (let hop = 0; hop < PLAN_MAX_TOOL_HOPS; hop++) {
-    const payload = {
-      model: env.GROQ_REASON_MODEL,
+    const data = await callGroq(apiKey, {
+      model: hopModel,
       messages,
       tools: [NBC_QUERY_TOOL],
       tool_choice: 'auto',
@@ -218,11 +224,7 @@ async function assessFloorplan(converted, env, apiKey) {
       max_completion_tokens: 900,
       reasoning_effort: 'low',
       include_reasoning: false,
-    };
-    let data = await callGroq(apiKey, payload);
-    if (data.error && hop === 0 && env.GROQ_LIGHT_MODEL) {
-      data = await callGroq(apiKey, { ...payload, model: env.GROQ_LIGHT_MODEL });
-    }
+    });
     if (data.error) return data;
 
     const msg = data.json?.choices?.[0]?.message;
@@ -650,10 +652,16 @@ async function groqReason(request, env, cors, apiKey) {
     }) },
   ];
 
-  // Tool-calling loop: let gpt-oss pull the exact clauses it needs.
+  // Tool-calling loop: let gpt-oss pull the exact clauses it needs. Deciding
+  // *which* clause to look up is a light task — run the hops on gpt-oss-20b
+  // (a separate TPM pool) and reserve gpt-oss-120b for the final synthesis
+  // below. Otherwise every hop of a single P6 call re-hits the same skinny
+  // 8000 TPM/min budget back-to-back and can exhaust it before the request
+  // that actually needs 120b's reasoning even runs.
+  const hopModel = env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL;
   for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
     const data = await callGroq(apiKey, {
-      model: env.GROQ_REASON_MODEL,
+      model: hopModel,
       messages,
       tools: [NBC_QUERY_TOOL],
       tool_choice: 'auto',
