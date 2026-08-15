@@ -38,6 +38,10 @@ class Opening:
     wall_id: str | None
     horizontal: bool
     confidence: float
+    # How many drawn sub-blocks the opening spans. A wide window is drawn as
+    # several units separated by mullions; they are one opening with one clear
+    # width, but the unit count is kept because it is visible in the drawing.
+    block_count: int = 1
 
 
 def detect_openings(
@@ -53,11 +57,15 @@ def detect_openings(
     door_span = max(12.0, scale * 0.045)      # a single-leaf door is ~4.5% of the short side
     stroke = max(2, int(round(scale * 0.004)))  # nominal thin-line stroke
 
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) if rgb.ndim == 3 else rgb
+    ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
     thin = _thin_ink(rgb, stroke)
     if thin is None or not thin.any():
         return []
 
-    windows = _detect_windows(thin, walls, door_span, stroke)
+    # Windows: hollow runs in exterior wall bands. Doors: swing arcs, which are
+    # mostly on interior walls, so the two searches do not compete.
+    windows = _detect_windows(ink, walls, door_span)
     doors = _detect_doors(thin, walls, door_span, windows)
     return _dedupe(doors + windows, min_separation=door_span * 0.5)
 
@@ -81,57 +89,248 @@ def _wall_axis(wall: Wall) -> tuple[bool, float, float, float]:
     return False, (x1 + x2) / 2.0, min(y1, y2), max(y1, y2)
 
 
+def _wall_thickness(wall: Wall) -> float:
+    """Drawn wall thickness in pixels (walls_from_mask stores it in this unit)."""
+    return max(2.0, float(getattr(wall, "thickness_mm", 0.0) or 0.0))
+
+
 def _nearest_wall(
-    cx: float, cy: float, walls: list[Wall], tolerance: float,
+    cx: float, cy: float, walls: list[Wall], slack: float,
 ) -> tuple[Wall | None, bool, float]:
-    """Nearest wall whose band contains this point, with its orientation."""
+    """Nearest wall whose own band contains this point.
+
+    The acceptance distance is derived per wall from its drawn thickness rather
+    than one global constant: an opening is drawn inside the wall it belongs to,
+    so a thick exterior wall legitimately admits a box further from its
+    centreline than a thin partition does.
+    """
     best: tuple[Wall | None, bool, float] = (None, True, float("inf"))
     for wall in walls:
         horizontal, fixed, lo, hi = _wall_axis(wall)
         along, across = (cx, cy) if horizontal else (cy, cx)
+        tolerance = _wall_thickness(wall) * 0.75 + slack
         if along < lo - tolerance or along > hi + tolerance:
             continue
         distance = abs(across - fixed)
-        if distance < best[2]:
+        if distance <= tolerance and distance < best[2]:
             best = (wall, horizontal, distance)
-    if best[2] > tolerance:
-        return (None, True, best[2])
     return best
 
 
-def _detect_windows(
-    thin: np.ndarray, walls: list[Wall], door_span: float, stroke: int,
-) -> list[Opening]:
-    """Thin boxes lying inside a wall band, with collinear blocks merged."""
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(thin, connectivity=8)
-    # Tolerance for "inside the wall band" — a window box sits within the wall,
-    # so allow roughly a wall thickness either side.
-    band_tolerance = max(4.0, door_span * 0.35)
-    blocks: list[tuple[Wall, bool, float, float, float]] = []  # wall, horiz, along, across, length
-    for index in range(1, count):
-        w = int(stats[index, cv2.CC_STAT_WIDTH])
-        h = int(stats[index, cv2.CC_STAT_HEIGHT])
-        area = int(stats[index, cv2.CC_STAT_AREA])
-        if area < max(6, stroke * 3):
-            continue
-        long_side, short_side = (max(w, h), min(w, h))
-        if long_side < max(5.0, door_span * 0.18):
-            continue
-        # A window block is elongated and thin — a blob or a big shape is not one.
-        if short_side > max(4.0, door_span * 0.5) or long_side < short_side * 1.6:
-            continue
-        cx, cy = float(centroids[index][0]), float(centroids[index][1])
-        wall, horizontal, _ = _nearest_wall(cx, cy, walls, band_tolerance)
-        if wall is None:
-            continue
-        # Its long axis must run ALONG the wall (a door leaf crosses it instead).
-        block_horizontal = w >= h
-        if block_horizontal != horizontal:
-            continue
-        along, across = (cx, cy) if horizontal else (cy, cx)
-        blocks.append((wall, horizontal, along, across, float(long_side)))
+@dataclass
+class PerimeterLine:
+    """One complete side of the building, rebuilt from collinear wall fragments."""
+    wall_id: str
+    horizontal: bool
+    fixed: float
+    lo: float
+    hi: float
+    thickness: float
 
-    return _merge_collinear(blocks, gap=max(6.0, door_span * 0.9))
+
+def perimeter_lines(walls: list[Wall], tolerance: float) -> list[PerimeterLine]:
+    """The building's four outer sides, as continuous lines.
+
+    Windows are only ever drawn on exterior walls, so restricting the search to
+    the perimeter removes furniture, stairs and dimension text in one step
+    rather than filtering each out by shape.
+
+    The wall trace returns fragments, not whole sides (a single exterior run is
+    broken into many short segments), so collinear fragments are first grouped
+    into one line per side. The outermost group on each axis is the exterior
+    wall; groups further in are interior partitions, and dimension lines sit
+    outside the building but carry almost no total span, so ranking by span
+    picks the real wall.
+    """
+    if not walls:
+        return []
+    groups: dict[tuple[bool, int], list[Wall]] = {}
+    for wall in walls:
+        horizontal, fixed, lo, hi = _wall_axis(wall)
+        key = (horizontal, int(round(fixed / max(1.0, tolerance))))
+        groups.setdefault(key, []).append(wall)
+
+    lines: list[PerimeterLine] = []
+    for (horizontal, _), members in groups.items():
+        axes = [_wall_axis(wall) for wall in members]
+        fixed = float(np.mean([axis[1] for axis in axes]))
+        lo = min(axis[2] for axis in axes)
+        hi = max(axis[3] for axis in axes)
+        covered = sum(axis[3] - axis[2] for axis in axes)
+        lines.append(PerimeterLine(
+            wall_id=members[0].id, horizontal=horizontal, fixed=fixed, lo=lo, hi=hi,
+            thickness=float(np.mean([_wall_thickness(wall) for wall in members])),
+        ))
+        lines[-1].__dict__["_covered"] = covered
+
+    return lines
+
+
+def _select_perimeter(
+    lines: list[PerimeterLine], ink: np.ndarray, tolerance: float,
+) -> list[PerimeterLine]:
+    """Keep the outermost line per side that is actually a wall.
+
+    Dimension lines sit further out than the building itself, so "outermost"
+    alone picks them. A wall is distinguished by being densely inked across its
+    band, which a dimension line — a single hairline — is not.
+    """
+    # TODO(next): replace this ranking with arrowhead rejection. Dimension lines
+    # are the only lines in an architectural drawing that carry arrowheads (or
+    # tick marks) at their ends — walls never do. Excluding those makes the
+    # perimeter simply "the outermost remaining line per side", with no scoring
+    # at all. The length x density ranking below is a stand-in for that and is
+    # the weak point: it still admits long interior walls and can miss an
+    # exterior wall whose trace is fragmented into short pieces.
+    scored: list[tuple[PerimeterLine, float]] = []
+    for line in lines:
+        covered = float(line.__dict__.get("_covered", 0.0))
+        if covered < tolerance * 2:
+            continue
+        # Rank by total ink carried along the line, i.e. length x density. An
+        # exterior wall is both long and solidly inked; a dimension line is long
+        # but hairline, and a short thick interior stub is dense but brief, so
+        # neither outranks a real perimeter wall on the product of the two.
+        density = _line_density(line, ink)
+        if density > 0:
+            scored.append((line, covered * density))
+    if not scored:
+        return []
+    strongest = max(mass for _, mass in scored)
+    walls_only = [line for line, mass in scored if mass >= strongest * 0.25]
+    chosen: list[PerimeterLine] = []
+    for horizontal in (True, False):
+        side = sorted(
+            (line for line in walls_only if line.horizontal == horizontal),
+            key=lambda line: line.fixed,
+        )
+        if not side:
+            continue
+        chosen.append(side[0])
+        if side[-1] is not side[0]:
+            chosen.append(side[-1])
+    return chosen
+
+
+def _line_density(line: PerimeterLine, ink: np.ndarray) -> float:
+    height, width = ink.shape[:2]
+    half = max(2, int(round(line.thickness * 0.5)))
+    fixed = int(round(line.fixed))
+    lo, hi = int(max(0, line.lo)), int(min(width if line.horizontal else height, line.hi))
+    if hi - lo < 2:
+        return 0.0
+    a = max(0, fixed - half)
+    b = min((height if line.horizontal else width), fixed + half + 1)
+    if b - a < 1:
+        return 0.0
+    band = ink[a:b, lo:hi] if line.horizontal else ink[lo:hi, a:b]
+    return float(band.mean()) if band.size else 0.0
+
+
+def _detect_windows(ink: np.ndarray, walls: list[Wall], door_span: float) -> list[Opening]:
+    """Windows are hollow runs inside an exterior wall band.
+
+    A solid wall band is dense ink; a window interrupts it with an outlined box
+    whose interior is empty, so ink density along the wall drops sharply. Each
+    wall is compared against its OWN median density, so this adapts to line
+    weight and drawing scale rather than assuming an absolute darkness.
+    """
+    height, width = ink.shape[:2]
+    openings: list[Opening] = []
+    tolerance = max(6.0, door_span * 0.5)
+    for line in _select_perimeter(perimeter_lines(walls, tolerance), ink, tolerance):
+        horizontal, fixed, lo, hi = line.horizontal, line.fixed, line.lo, line.hi
+        span = int(hi - lo)
+        if span < max(8, int(door_span * 0.5)):
+            continue
+        half = max(3, int(round(line.thickness * 0.75)))
+        fixed_i = int(round(fixed))
+        a, b = max(0, fixed_i - half), min((height if horizontal else width), fixed_i + half + 1)
+        if b - a < 2:
+            continue
+        profile = _density_profile(ink, horizontal, int(lo), span, a, b)
+        if profile.size < 4:
+            continue
+        solid = float(np.median(profile))
+        if solid <= 1e-6:
+            continue
+        hollow = profile < solid * 0.62
+        runs = _runs(hollow, min_length=max(3, int(door_span * 0.25)))
+        # A wide window is drawn as several units separated by mullions, which
+        # show up as short dense spikes. Those are one opening with one clear
+        # width, so adjacent runs are merged and the unit count recorded.
+        for start, end, blocks in _merge_units(runs, mullion=max(3, int(door_span * 0.55))):
+            centre_along = lo + (start + end) / 2.0
+            centre = (centre_along, fixed) if horizontal else (fixed, centre_along)
+            openings.append(Opening(
+                kind="window",
+                center=(float(centre[0]), float(centre[1])),
+                width_px=float(end - start),
+                wall_id=line.wall_id,
+                horizontal=horizontal,
+                confidence=0.75 if blocks > 1 else 0.65,
+                block_count=blocks,
+            ))
+    return openings
+
+
+def _merge_units(runs: list[tuple[int, int]], mullion: int) -> list[tuple[int, int, int]]:
+    """Join runs separated by no more than a mullion into one opening."""
+    if not runs:
+        return []
+    merged: list[tuple[int, int, int]] = []
+    start, end, blocks = runs[0][0], runs[0][1], 1
+    for run_start, run_end in runs[1:]:
+        if run_start - end <= mullion:
+            end, blocks = run_end, blocks + 1
+        else:
+            merged.append((start, end, blocks))
+            start, end, blocks = run_start, run_end, 1
+    merged.append((start, end, blocks))
+    return merged
+
+
+def _density_profile(
+    ink: np.ndarray, horizontal: bool, origin: int, span: int, a: int, b: int,
+) -> np.ndarray:
+    """Mean ink across the wall band at each step along the wall."""
+    values: list[float] = []
+    limit = ink.shape[1] if horizontal else ink.shape[0]
+    for step in range(span):
+        position = origin + step
+        if position < 0 or position >= limit:
+            values.append(0.0)
+            continue
+        strip = ink[a:b, position] if horizontal else ink[position, a:b]
+        values.append(float(strip.mean()))
+    return np.array(values, dtype=float)
+
+
+def _runs(flags: np.ndarray, min_length: int) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if index - start >= min_length:
+                runs.append((start, index))
+            start = None
+    if start is not None and len(flags) - start >= min_length:
+        runs.append((start, len(flags)))
+    return runs
+
+
+def _count_blocks(segment: np.ndarray, solid: float) -> int:
+    """Sub-units within one window, separated by drawn mullions.
+
+    A mullion is a short density spike inside an otherwise hollow run, so the
+    deeply-hollow stretches either side of it are the individual units.
+    """
+    if segment.size == 0:
+        return 1
+    deep = segment < solid * 0.45
+    return max(1, len(_runs(deep, min_length=2)))
 
 
 def _merge_collinear(
@@ -183,7 +382,6 @@ def _detect_doors(
 ) -> list[Opening]:
     """Swing arcs: circular, and bulging perpendicular away from their wall."""
     contours, _ = cv2.findContours(thin, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    jamb_tolerance = door_span * 1.2
     openings: list[Opening] = []
     for contour in contours:
         if len(contour) < 8:
@@ -199,8 +397,14 @@ def _detect_doors(
         cx, cy, radius, residual = fit
         if residual > 0.16 or not (door_span * 0.35 <= radius <= door_span * 2.0):
             continue
-        # The hinge sits on a wall, and the arc sweeps away from it.
-        wall, horizontal, distance = _nearest_wall(cx, cy, walls, jamb_tolerance)
+        # Furniture (round tables, chairs) fits a circle at least as well as a
+        # swing arc does — what separates them is that furniture closes on
+        # itself while a swing is a partial sweep.
+        if _angular_coverage(points, cx, cy) > 300.0:
+            continue
+        # The hinge sits on its wall, within that wall's own drawn thickness —
+        # not merely somewhere near it, which is what let interior furniture in.
+        wall, horizontal, distance = _nearest_wall(cx, cy, walls, slack=door_span * 0.15)
         if wall is None:
             continue
         if not _bulges_off_wall(points, cx, cy, horizontal, radius):
@@ -230,6 +434,20 @@ def _bulges_off_wall(
     parallel = float(np.abs(along).max())
     # Must reach well off the wall line, and not be a sliver lying along it.
     return perpendicular >= radius * 0.45 and perpendicular >= parallel * 0.35
+
+
+def _angular_coverage(points: np.ndarray, cx: float, cy: float) -> float:
+    """Degrees of the circle actually occupied, ignoring the largest empty gap.
+
+    A door swing is a partial sweep (a quarter turn, drawn out-and-back so it
+    reads as roughly half the circle); a round table or chair closes on itself
+    and covers essentially all of it. This is what keeps furniture out.
+    """
+    angles = np.sort(np.arctan2(points[:, 1] - cy, points[:, 0] - cx))
+    if len(angles) < 3:
+        return 360.0
+    gaps = np.diff(np.r_[angles, angles[0] + 2 * math.pi])
+    return float(math.degrees(2 * math.pi - gaps.max()))
 
 
 def _fit_circle(points: np.ndarray) -> tuple[float, float, float, float] | None:
