@@ -38,6 +38,8 @@ def health():
         "qwenConfigured": bool(os.environ.get("GROQ_API_KEY")),
         "visionPasses": 2,
         "reasoningModel": "openai/gpt-oss-120b",
+        "easyOcrBundled": True,
+        "easyOcrRuntimeEnabled": os.environ.get("ENABLE_EASYOCR_RUNTIME") == "1",
         "requestScopedQwenSupported": True,
         "serviceTokenConfigured": bool(os.environ.get("FLOORPLAN_SERVICE_TOKEN")),
         "cubicCasaEnabled": os.environ.get("ENABLE_NONCOMMERCIAL_CUBICASA") == "1",
@@ -94,6 +96,7 @@ async def convert_plan(
                 overall=overall or None,
                 weights=Path("/app/weights/model_best_val_loss_var.pkl"),
                 use_model=os.environ.get("ENABLE_NONCOMMERCIAL_CUBICASA") == "1",
+                ocr=os.environ.get("ENABLE_EASYOCR_RUNTIME") == "1",
                 guide=guide,
                 guide_required=False,
             )
