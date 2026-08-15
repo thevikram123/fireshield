@@ -74,51 +74,74 @@ class QwenTopologyGuide:
             "\"add_windows\":[same],\"room_labels\":[{\"room_id\":str,\"label\":str,\"type\":str,"
             "\"confidence\":0..1}]}. Omit uncertain proposals. Extracted topology: " + json.dumps(compact)
         )
-        body = json.dumps({
-            "model": self.model,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_url}},
-            ]}],
-            "temperature": 0.1,
-            "max_completion_tokens": 1800,
-            "response_format": {"type": "json_object"},
-            "stream": False,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "FireShield-Floorplan/1.0",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as response:
-                result = json.load(response)
-        except urllib.error.HTTPError as exc:
-            provider_message = _provider_error_message(exc)
-            suffix = f": {provider_message}" if provider_message else ""
-            raise RuntimeError(f"Qwen request failed ({exc.code}){suffix}") from exc
+        result = None
+        for attempt in range(2):
+            attempt_prompt = prompt
+            if attempt:
+                attempt_prompt += (
+                    " Previous generation failed JSON validation. Return exactly one complete JSON object "
+                    "matching the requested keys, with no markdown, comments, or trailing text."
+                )
+            body = json.dumps({
+                "model": self.model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": attempt_prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]}],
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "presence_penalty": 1.5,
+                "max_completion_tokens": 1800,
+                "reasoning_effort": "none",
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "FireShield-Floorplan/1.0",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    result = json.load(response)
+                break
+            except urllib.error.HTTPError as exc:
+                provider_code, provider_message = _provider_error_details(exc)
+                if exc.code == 400 and provider_code == "json_validate_failed" and attempt == 0:
+                    continue
+                suffix = f": {provider_message}" if provider_message else ""
+                raise RuntimeError(f"Qwen request failed ({exc.code}){suffix}") from exc
+        if result is None:
+            raise RuntimeError("Qwen request failed after JSON validation retry")
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
         return json.loads(content)
 
 
 def _provider_error_message(error: urllib.error.HTTPError) -> str:
     """Return only Groq's bounded error message/code, never headers or keys."""
+    _, message = _provider_error_details(error)
+    return message
+
+
+def _provider_error_details(error: urllib.error.HTTPError) -> tuple[str, str]:
+    """Return Groq's bounded error code and display message."""
     try:
         payload = json.loads(error.read(4096).decode("utf-8", errors="replace"))
         detail = payload.get("error", payload) if isinstance(payload, dict) else {}
         if not isinstance(detail, dict):
-            return ""
+            return "", ""
         message = str(detail.get("message", ""))[:500]
         code = str(detail.get("code", ""))[:100]
-        return f"{code}: {message}" if code and code not in message else message
+        display = f"{code}: {message}" if code and code not in message else message
+        return code, display
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return ""
+        return "", ""
 
 
 def apply_guidance(
