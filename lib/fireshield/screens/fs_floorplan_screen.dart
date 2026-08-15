@@ -464,16 +464,25 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
     final score = result.compliance['score'];
     final findings = result.compliance['findings'] as List? ?? const [];
     final limitations = result.compliance['limitations'] as List? ?? const [];
+    final numericScore = _bestAvailableScore(score, findings);
+    final basis = result.compliance['scoreBasis']?.toString() ??
+        (score is num ? 'unspecified' : 'client_evidence_fallback');
+    final confidence = result.compliance['scoreConfidence'];
+    final status = result.compliance['assessmentStatus']?.toString() ??
+        'provisional';
     return FsCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text('NBCS plan assessment', style: FsText.cardTitle),
           Text(
-            score is num
-                ? 'Verifiable compliance score: ${score.round()}/100'
-                : 'No score issued: insufficient verifiable plan evidence',
+            'Best-available compliance score: ${numericScore.round()}/100',
             style: FsText.small,
+          ),
+          Text(
+            'Basis: ${basis.replaceAll('_', ' ')} · $status'
+            '${confidence is num ? ' · ${(confidence * 100).round()}% evidence confidence' : ''}',
+            style: FsText.tiny.copyWith(color: FsColors.muted),
           ),
           if ((result.compliance['planSummary']?.toString() ?? '').isNotEmpty)
             Padding(
@@ -502,5 +511,25 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
         ],
       ),
     );
+  }
+
+  num _bestAvailableScore(dynamic supplied, List findings) {
+    if (supplied is num && supplied.isFinite) return supplied.clamp(0, 100);
+    const statusScore = {
+      'compliant': 100,
+      'gap': 35,
+      'critical_gap': 0,
+      'cannot_verify': 50,
+    };
+    const severityWeight = {'minor': 1, 'major': 2, 'critical': 3};
+    num weighted = 0;
+    num total = 0;
+    for (final raw in findings) {
+      if (raw is! Map) continue;
+      final weight = severityWeight[raw['severity']?.toString()] ?? 1;
+      weighted += (statusScore[raw['status']?.toString()] ?? 50) * weight;
+      total += weight;
+    }
+    return total == 0 ? 50 : (weighted / total).clamp(0, 100);
   }
 }

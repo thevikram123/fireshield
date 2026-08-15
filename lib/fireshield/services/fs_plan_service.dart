@@ -13,6 +13,7 @@ import 'fs_groq_service.dart';
 
 class FsPlanResult {
   final Map<String, dynamic> topology;
+  final Map<String, dynamic> commercialModel;
   final Map<String, dynamic> guidance;
   final Map<String, dynamic> metrics;
   final Map<String, dynamic> artifacts;
@@ -21,6 +22,7 @@ class FsPlanResult {
 
   const FsPlanResult({
     required this.topology,
+    required this.commercialModel,
     required this.guidance,
     required this.metrics,
     required this.artifacts,
@@ -30,6 +32,8 @@ class FsPlanResult {
 
   factory FsPlanResult.fromJson(Map<String, dynamic> json) => FsPlanResult(
         topology: Map<String, dynamic>.from(json['topology'] as Map? ?? {}),
+        commercialModel:
+            Map<String, dynamic>.from(json['commercialModel'] as Map? ?? {}),
         guidance: Map<String, dynamic>.from(json['guidance'] as Map? ?? {}),
         metrics: Map<String, dynamic>.from(json['metrics'] as Map? ?? {}),
         artifacts: Map<String, dynamic>.from(json['artifacts'] as Map? ?? {}),

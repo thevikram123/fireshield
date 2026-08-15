@@ -75,7 +75,11 @@ export default {
           floorplanConfigured: Boolean(
             env.FLOORPLAN_SERVICE_URL && env.FLOORPLAN_SERVICE_TOKEN && env.PLAN_RATE_LIMITER,
           ),
-          models: { vision: env.GROQ_VISION_MODEL, reason: env.GROQ_REASON_MODEL },
+          models: {
+            vision: env.GROQ_VISION_MODEL,
+            reason: env.GROQ_REASON_MODEL,
+            lightFallback: env.GROQ_LIGHT_MODEL,
+          },
         }, 200, cors);
       }
 
@@ -158,10 +162,19 @@ async function convertFloorplan(request, env, cors, groqKey) {
   const compliance = await assessFloorplan(converted, env, groqKey);
   if (compliance.error) {
     return json({
-      error: compliance.error,
-      stage: 'nbcs_plan_assessment',
-      conversionCompleted: true,
-    }, compliance.status, { ...cors, ...compliance.headers });
+      ...converted,
+      partial: true,
+      compliance: {
+        assessmentStatus: 'unavailable',
+        planSummary: 'Plan conversion completed, but the NBCS reasoning provider did not return an assessment.',
+        score: 50,
+        scoreBasis: 'evidence_availability',
+        scoreConfidence: 0.05,
+        findings: [],
+        citedClauses: [],
+        limitations: [compliance.error],
+      },
+    }, 200, { ...cors, ...compliance.headers });
   }
   return json({ ...converted, compliance: compliance.value }, 200, cors);
 }
@@ -186,7 +199,7 @@ async function assessFloorplan(converted, env, apiKey) {
   }));
   const plan = compactPlanForReasoning(converted);
   const reasoningContext = fitPlanReasoningContext(plan, guidance);
-  const data = await callGroq(apiKey, {
+  const payload = {
     model: env.GROQ_REASON_MODEL,
     messages: [
       { role: 'system', content: PLAN_REASON_SYSTEM },
@@ -197,13 +210,49 @@ async function assessFloorplan(converted, env, apiKey) {
     reasoning_effort: 'low',
     include_reasoning: false,
     response_format: PLAN_RESPONSE_FORMAT,
-  });
+  };
+  let data = await callGroq(apiKey, payload);
+  if (data.error && env.GROQ_LIGHT_MODEL) {
+    data = await callGroq(apiKey, { ...payload, model: env.GROQ_LIGHT_MODEL });
+  }
   if (data.error) return data;
   const value = safeJson(data.json?.choices?.[0]?.message?.content);
   if (!value || !Array.isArray(value.findings)) {
     return { error: 'GPT-OSS returned an invalid plan assessment', status: 502, headers: {} };
   }
-  return { value };
+  return { value: finalisePlanAssessment(value, plan) };
+}
+
+function finalisePlanAssessment(value, plan) {
+  const findings = Array.isArray(value.findings) ? value.findings : [];
+  const severityWeight = { minor: 1, major: 2, critical: 3 };
+  const statusScore = { compliant: 100, gap: 35, critical_gap: 0, cannot_verify: 50 };
+  let weightedScore = 0;
+  let totalWeight = 0;
+  let verifiable = 0;
+  for (const finding of findings) {
+    const weight = severityWeight[finding.severity] || 1;
+    weightedScore += (statusScore[finding.status] ?? 50) * weight;
+    totalWeight += weight;
+    if (finding.status !== 'cannot_verify') verifiable++;
+  }
+  const calculated = totalWeight ? weightedScore / totalWeight : 50;
+  const supplied = typeof value.score === 'number' ? value.score : Number.NaN;
+  const score = Number.isFinite(supplied) ? supplied : calculated;
+  const evidenceFraction = findings.length ? verifiable / findings.length : 0;
+  const geometryVerified = plan.assessmentMode === 'verified_geometry';
+  const reviewConfidence = Number(plan.qwenReview?.reviewConfidence) || 0;
+  const specificationConfidence = Number(plan.imageSemanticEvidence?.specificationConfidence) || 0;
+  const confidence = geometryVerified
+    ? 0.55 + 0.25 * evidenceFraction + 0.20 * reviewConfidence
+    : 0.15 + 0.35 * evidenceFraction + 0.30 * specificationConfidence;
+  return {
+    ...value,
+    assessmentStatus: geometryVerified && evidenceFraction >= 0.5 ? 'complete' : 'provisional',
+    score: Math.round(Math.max(0, Math.min(score, 100)) * 10) / 10,
+    scoreBasis: plan.assessmentMode,
+    scoreConfidence: Math.round(Math.max(0.05, Math.min(confidence, 1)) * 100) / 100,
+  };
 }
 
 function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
@@ -269,8 +318,12 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
 
 function compactPlanForReasoning(converted) {
   const topology = converted?.topology || {};
+  const guidance = converted?.guidance || {};
+  const geometryApproved = guidance.reviewStatus === 'approved';
+  const commercialFloor = converted?.commercialModel?.floor || {};
   const point = (value) => Array.isArray(value) ? value.slice(0, 2).map(Number) : value;
   return {
+    assessmentMode: geometryApproved ? 'verified_geometry' : 'image_semantic',
     buildingProfile: {
       occupancy: String(converted?.buildingProfile?.occupancy || '').slice(0, 100),
       buildingHeightM: Number(converted?.buildingProfile?.buildingHeightM) || null,
@@ -285,36 +338,47 @@ function compactPlanForReasoning(converted) {
       discrepancies: Array.isArray(converted?.guidance?.discrepancies)
         ? converted.guidance.discrepancies.slice(0, 10) : [],
     },
-    metrics: converted?.metrics || {},
-    units: topology.units,
-    mmPerPx: topology.mm_per_px,
+    metrics: { ...(converted?.metrics || {}), geometryVerified: geometryApproved },
+    units: geometryApproved ? topology.units : 'unverified',
+    mmPerPx: geometryApproved ? topology.mm_per_px : null,
     imageSize: topology.image_size,
-    exteriorBoundary: Array.isArray(topology.exterior_boundary)
+    exteriorBoundary: geometryApproved && Array.isArray(topology.exterior_boundary)
       ? topology.exterior_boundary.slice(0, 60).map(point) : [],
-    rooms: Array.isArray(topology.rooms) ? topology.rooms.slice(0, 50).map((room) => ({
+    rooms: geometryApproved && Array.isArray(topology.rooms) ? topology.rooms.slice(0, 50).map((room) => ({
       id: room.id, type: room.type, label: room.label,
       area_mm2: room.area_mm2,
       boundary: Array.isArray(room.boundary) ? room.boundary.slice(0, 24).map(point) : [],
     })) : [],
-    doors: Array.isArray(topology.doors) ? topology.doors.slice(0, 80).map((door) => ({
+    doors: geometryApproved && Array.isArray(topology.doors) ? topology.doors.slice(0, 80).map((door) => ({
       id: door.id, wall_id: door.wall_id, width_mm: door.width_mm, center: point(door.center),
     })) : [],
-    windows: Array.isArray(topology.windows) ? topology.windows.slice(0, 80).map((window) => ({
+    windows: geometryApproved && Array.isArray(topology.windows) ? topology.windows.slice(0, 80).map((window) => ({
       id: window.id, wall_id: window.wall_id, width_mm: window.width_mm, center: point(window.center),
     })) : [],
-    objects: Array.isArray(topology.objects) ? topology.objects.slice(0, 80).map((object) => ({
+    objects: geometryApproved && Array.isArray(topology.objects) ? topology.objects.slice(0, 80).map((object) => ({
       id: object.id, type: object.type, center: point(object.center), confidence: object.confidence,
     })) : [],
     roomGraph: {
-      nodes: Array.isArray(topology.room_graph?.nodes) ? topology.room_graph.nodes.slice(0, 80)
+      nodes: geometryApproved && Array.isArray(topology.room_graph?.nodes) ? topology.room_graph.nodes.slice(0, 80)
         .map((node) => typeof node === 'object' ? {
           id: String(node.id || '').slice(0, 80), type: String(node.type || '').slice(0, 80),
         } : String(node).slice(0, 80)) : [],
-      edges: Array.isArray(topology.room_graph?.edges) ? topology.room_graph.edges.slice(0, 120)
+      edges: geometryApproved && Array.isArray(topology.room_graph?.edges) ? topology.room_graph.edges.slice(0, 120)
         .map((edge) => typeof edge === 'object' ? {
           source: String(edge.source || '').slice(0, 80), target: String(edge.target || '').slice(0, 80),
           type: String(edge.type || '').slice(0, 80),
         } : String(edge).slice(0, 160)) : [],
+    },
+    imageSemanticEvidence: geometryApproved ? null : {
+      specificationStatus: guidance.specificationStatus,
+      specificationConfidence: guidance.specificationConfidence,
+      specificationSummary: String(guidance.specificationSummary || '').slice(0, 500),
+      reviewSummary: String(guidance.reviewSummary || '').slice(0, 500),
+      visibleSpaces: Array.isArray(commercialFloor.spaces) ? commercialFloor.spaces.slice(0, 80).map((space) => ({
+        id: space.id, name: space.name, type: space.type, evidence: space.evidence,
+      })) : [],
+      circulation: commercialFloor.circulation || {},
+      fireLifeSafety: commercialFloor.fireLifeSafety || {},
     },
   };
 }
@@ -636,13 +700,16 @@ const PLAN_REASON_SYSTEM =
   + 'not as a code authority. Use only the supplied NBCS guidance for regulatory requirements and cite its '
   + 'page and clause identifiers. Never infer scale, occupancy, door purpose, exit designation, fire rating, '
   + 'travel path, stair discharge, or protection equipment when the structured plan does not establish it. '
+  + 'When assessmentMode is image_semantic, provide useful visual/semantic observations and NBCS follow-up '
+  + 'requirements, but never use rejected geometry for numeric pass/fail conclusions. '
   + 'If units are px or the Qwen review is insufficient, measurements are cannot_verify. A missing detected '
-  + 'object is not proof of absence. Return JSON only: {"planSummary":string,"score":number|null,'
+  + 'object is not proof of absence. Return JSON only: {"planSummary":string,"score":number,'
   + '"findings":[{"check":string,"status":"compliant"|"gap"|"critical_gap"|"cannot_verify",'
   + '"severity":"minor"|"major"|"critical","observed":string,"required":string,"measurementEvidence":string,'
   + '"clauseId":string,"page":number|null,"rationale":string}],'
   + '"citedClauses":[{"id":string,"title":string,"page":number}],"limitations":[string]}. '
-  + 'Only assign a numeric score when enough checks are verifiable; otherwise score must be null.';
+  + 'Always assign a numeric best-available score from 0 to 100 using all findings. Treat cannot_verify as '
+  + 'neutral uncertainty, never as a pass. The gateway separately calculates scoreBasis and scoreConfidence.';
 
 const PLAN_RESPONSE_FORMAT = {
   type: 'json_schema',
@@ -654,7 +721,7 @@ const PLAN_RESPONSE_FORMAT = {
       additionalProperties: false,
       properties: {
         planSummary: { type: 'string' },
-        score: { type: ['number', 'null'] },
+        score: { type: 'number' },
         findings: {
           type: 'array',
           items: {
@@ -690,7 +757,9 @@ const PLAN_RESPONSE_FORMAT = {
         },
         limitations: { type: 'array', items: { type: 'string' } },
       },
-      required: ['planSummary', 'score', 'findings', 'citedClauses', 'limitations'],
+      required: [
+        'planSummary', 'score', 'findings', 'citedClauses', 'limitations',
+      ],
     },
   },
 };

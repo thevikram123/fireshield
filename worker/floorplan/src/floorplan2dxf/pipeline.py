@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .calibrate import calibrate_auto, parse_overall
+from .commercial_model import build_commercial_model
+from .correction import constrain_geometry_to_spec
 from .export_dxf import write_dxf
 from .geometry import extract_geometry
 from .ingest import load_raster
@@ -26,6 +28,7 @@ class ConvertResult:
     overlay_path: Optional[Path]
     mm_per_px: Optional[float]
     warnings: list[str]
+    commercial_model: dict
 
 
 def convert(
@@ -53,7 +56,25 @@ def convert(
     src = Path(path)
     raster = load_raster(src, page=page, dpi=dpi)
     prep = preprocess(raster.rgb, max_side=max_side)
+    plan_spec = {}
+    if guide is not None and hasattr(guide, "specify"):
+        try:
+            plan_spec = guide.specify(prep.display_rgb)
+        except Exception as exc:
+            if guide_required:
+                raise
+            warnings.append(f"Vision-first specification failed ({exc}); using unconstrained extraction.")
     cv_geom = extract_geometry(prep.display_rgb, prep.wall_mask)
+    if plan_spec:
+        constraint = constrain_geometry_to_spec(
+            cv_geom, plan_spec, (prep.display_rgb.shape[1], prep.display_rgb.shape[0])
+        )
+        if constraint.get("applied"):
+            warnings.append(
+                "Vision-first constraints applied: "
+                f"{constraint['matchedWalls']}/{constraint['specifiedWalls']} walls and "
+                f"{constraint['matchedRooms']}/{constraint['specifiedRooms']} rooms matched to pixels."
+            )
 
     recog = Recognition(
         polygons=None,
@@ -141,7 +162,22 @@ def convert(
     json_path = None
     if json_out:
         json_path = Path(json_out) if isinstance(json_out, (str, Path)) else dxf_path.with_suffix(".json")
-        json_path.write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")
+        commercial_model = build_commercial_model(
+            plan,
+            building_profile=getattr(guide, "building_profile", {}),
+            plan_spec=plan_spec,
+            guidance_audit=vars(guide.audit) if guide is not None and hasattr(guide, "audit") else {},
+        )
+        json_path.write_text(json.dumps({
+            "topology": plan.to_dict(), "commercialModel": commercial_model,
+        }, indent=2), encoding="utf-8")
+    else:
+        commercial_model = build_commercial_model(
+            plan,
+            building_profile=getattr(guide, "building_profile", {}),
+            plan_spec=plan_spec,
+            guidance_audit=vars(guide.audit) if guide is not None and hasattr(guide, "audit") else {},
+        )
 
     return ConvertResult(
         model=plan,
@@ -150,4 +186,5 @@ def convert(
         overlay_path=overlay_path,
         mm_per_px=scale,
         warnings=warnings,
+        commercial_model=commercial_model,
     )

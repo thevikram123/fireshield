@@ -36,6 +36,7 @@ def health():
         "ok": True,
         "service": "fireshield-floorplan",
         "qwenConfigured": bool(os.environ.get("GROQ_API_KEY")),
+        "openrouterCorrectionConfigured": bool(os.environ.get("OPENROUTER_API_KEY")),
         "requestScopedQwenSupported": True,
         "serviceTokenConfigured": bool(os.environ.get("FLOORPLAN_SERVICE_TOKEN")),
         "cubicCasaEnabled": os.environ.get("ENABLE_NONCOMMERCIAL_CUBICASA") == "1",
@@ -67,11 +68,18 @@ async def convert_plan(
     profile = _building_profile(building_profile)
 
     guide = None
+    vision_setup_warning = ""
     if require_qwen:
         try:
-            guide = QwenTopologyGuide(api_key=groq_api_key)
+            guide = QwenTopologyGuide(
+                api_key=groq_api_key,
+                openrouter_api_key=os.environ.get("OPENROUTER_API_KEY"),
+                building_profile=profile,
+            )
         except RuntimeError as exc:
-            raise HTTPException(503, str(exc)) from exc
+            vision_setup_warning = (
+                f"Vision guidance unavailable; best-available deterministic artifacts were still produced: {exc}"
+            )
 
     try:
         with tempfile.TemporaryDirectory(prefix="fireshield-plan-") as temp:
@@ -87,22 +95,31 @@ async def convert_plan(
                 weights=Path("/app/weights/model_best_val_loss_var.pkl"),
                 use_model=os.environ.get("ENABLE_NONCOMMERCIAL_CUBICASA") == "1",
                 guide=guide,
-                guide_required=require_qwen,
+                guide_required=False,
             )
+            if vision_setup_warning:
+                result.warnings.append(vision_setup_warning)
             json_path = result.json_path
             overlay_path = result.overlay_path
             return {
                 "buildingProfile": profile,
                 "topology": result.model.to_dict(),
+                "commercialModel": result.commercial_model,
                 "warnings": result.warnings,
                 "guidance": {
                     "required": require_qwen,
+                    "specificationStatus": guide.audit.specification_status if guide else "not_run",
+                    "specificationConfidence": guide.audit.specification_confidence if guide else 0,
+                    "specificationSummary": guide.audit.specification_summary if guide else "",
+                    "initialReviewStatus": guide.audit.initial_review_status if guide else "not_run",
                     "reviewStatus": guide.audit.review_status if guide else "not_run",
                     "reviewConfidence": guide.audit.review_confidence if guide else 0,
                     "reviewSummary": guide.audit.review_summary if guide else "",
                     "discrepancies": guide.audit.discrepancies if guide else [],
                     "accepted": guide.audit.accepted if guide else [],
                     "rejected": guide.audit.rejected if guide else [],
+                    "correctionStatus": guide.audit.correction_status if guide else "not_run",
+                    "correctionModel": guide.audit.correction_model if guide else "",
                 },
                 "artifacts": {
                     "plan.dxf": _artifact(dxf, "application/dxf"),

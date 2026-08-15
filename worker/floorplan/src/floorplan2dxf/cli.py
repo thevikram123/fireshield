@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -37,6 +39,26 @@ def main(argv: list[str] | None = None) -> int:
     p_cv.add_argument("--json", dest="json_out", type=Path, default=None)
     p_cv.add_argument("--no-overlay", action="store_true")
     p_cv.add_argument("--no-json", action="store_true")
+    p_cv.add_argument(
+        "--vision-first", action="store_true",
+        help="Ask Qwen for a plan specification before deterministic extraction",
+    )
+    p_cv.add_argument(
+        "--no-ai-correction", action="store_true",
+        help="Run vision-first specification/review but do not invoke the correction planner",
+    )
+    p_cv.add_argument(
+        "--audit-json", type=Path, default=None,
+        help="Write the model specification/review/correction audit as JSON",
+    )
+    p_cv.add_argument(
+        "--machine-readable", action="store_true",
+        help="Print one JSON result object instead of the human-readable summary",
+    )
+    p_cv.add_argument(
+        "--building-profile-json", default="{}",
+        help='Commercial context JSON, e.g. {"occupancy":"Business","buildingHeightM":24}',
+    )
 
     p_demo = sub.add_parser("demo", help="Write the semantic bedroom example DXF/JSON (no model needed)")
     p_demo.add_argument("--out-dir", type=Path, default=Path("out"))
@@ -58,6 +80,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     from .pipeline import convert
+
+    guide = None
+    if args.vision_first:
+        from .guidance import QwenTopologyGuide
+
+        try:
+            building_profile = json.loads(args.building_profile_json)
+            if not isinstance(building_profile, dict):
+                raise ValueError("profile must be an object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            parser.error(f"--building-profile-json must be a JSON object: {exc}")
+
+        guide = QwenTopologyGuide(
+            api_key=os.environ.get("GROQ_API_KEY"),
+            openrouter_api_key=os.environ.get("OPENROUTER_API_KEY"),
+            enable_correction=not args.no_ai_correction,
+            building_profile=building_profile,
+        )
 
     overlay: Path | bool
     if args.no_overlay:
@@ -91,7 +131,29 @@ def main(argv: list[str] | None = None) -> int:
         threshold=args.threshold,
         overlay=overlay,
         json_out=json_out,
+        guide=guide,
+        guide_required=args.vision_first,
     )
+    audit = vars(guide.audit) if guide else None
+    if args.audit_json:
+        args.audit_json.parent.mkdir(parents=True, exist_ok=True)
+        args.audit_json.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    if args.machine_readable:
+        print(json.dumps({
+            "dxf": str(result.dxf_path),
+            "json": str(result.json_path) if result.json_path else None,
+            "overlay": str(result.overlay_path) if result.overlay_path else None,
+            "units": result.model.units,
+            "mmPerPx": result.mm_per_px,
+            "metrics": {
+                "walls": len(result.model.walls), "doors": len(result.model.doors),
+                "windows": len(result.model.windows), "rooms": len(result.model.rooms),
+                "texts": len(result.model.texts),
+            },
+            "warnings": result.warnings,
+            "guidance": audit,
+        }))
+        return 0
     print(f"DXF      {result.dxf_path}")
     if result.json_path:
         print(f"JSON     {result.json_path}")

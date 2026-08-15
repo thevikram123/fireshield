@@ -18,43 +18,108 @@ import cv2
 import numpy as np
 
 from .schema import Door, FloorplanModel, Wall, Window
+from .correction import TopologyCorrectionPlanner, apply_corrections
 
 
 @dataclass
 class GuidanceAudit:
+    specification_status: str = "not_run"
+    specification_confidence: float = 0.0
+    specification_summary: str = ""
+    initial_review_status: str = "not_run"
     review_status: str = "not_run"
     review_confidence: float = 0.0
     review_summary: str = ""
     discrepancies: list[dict] = field(default_factory=list)
     accepted: list[dict] = field(default_factory=list)
     rejected: list[dict] = field(default_factory=list)
+    correction_status: str = "not_run"
+    correction_model: str = ""
 
 
 class QwenTopologyGuide:
     """Ask Qwen to identify omissions, then apply only safe geometric additions."""
 
-    def __init__(self, api_key: str | None = None, model: str = "qwen/qwen3.6-27b"):
+    def __init__(self, api_key: str | None = None, model: str = "qwen/qwen3.6-27b",
+                 openrouter_api_key: str | None = None, enable_correction: bool = True,
+                 building_profile: dict | None = None):
         self.api_key = api_key or os.environ.get("GROQ_API_KEY", "")
+        self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.model = model
+        self.enable_correction = enable_correction
+        self.building_profile = building_profile or {}
         self.audit = GuidanceAudit()
+        self.plan_spec: dict = {}
         if not self.api_key:
             raise RuntimeError("GROQ_API_KEY is not configured")
 
     def __call__(self, rgb: np.ndarray, model: FloorplanModel) -> FloorplanModel:
         payload = self._request(rgb, model)
+        self._capture_review(payload, initial=True)
+        model = apply_guidance(model, payload, self.audit)
+        if self.audit.review_status != "needs_correction" or not self.enable_correction:
+            if self.audit.review_status == "needs_correction" and not self.enable_correction:
+                self.audit.correction_status = "disabled"
+            return model
+        try:
+            planner = TopologyCorrectionPlanner(self.openrouter_api_key, self.api_key)
+            proposals = planner.propose(rgb, model, self.audit.discrepancies)
+            model = apply_corrections(rgb, model, proposals, self.audit.accepted, self.audit.rejected)
+            self.audit.correction_model = planner.model_used
+            self.audit.correction_status = "applied" if any(
+                item.get("kind") in {"remove_wall", "replace_wall", "add_wall"}
+                for item in self.audit.accepted
+            ) else "no_valid_operations"
+            revised = self._request(rgb, model)
+            self._capture_review(revised, initial=False)
+            model = apply_guidance(model, revised, self.audit)
+        except Exception as exc:
+            self.audit.correction_status = "failed"
+            self.audit.rejected.append({"kind": "correction_stage", "reason": str(exc)[:500]})
+        return model
+
+    def specify(self, rgb: np.ndarray) -> dict:
+        """Create the vision-first semantic target that constrains reconstruction."""
+        height, width = rgb.shape[:2]
+        prompt = (
+            "Inspect this floor-plan image before any geometry extraction. Define what a deterministic Python "
+            "reconstructor should produce. Coordinates are pixels in image_size. Return JSON only: "
+            '{"status":"usable|insufficient","confidence":0..1,"summary":string,'
+            '"spaces":[{"label":string,"type":string,"category":"occupied|circulation|service|shaft|safety",'
+            '"center":[x,y],"bbox":[x0,y0,x1,y1],'
+            '"confidence":0..1}],"major_walls":[{"orientation":"horizontal|vertical",'
+            '"start":[x,y],"end":[x,y],"kind":"external|internal","confidence":0..1}],'
+            '"openings":[{"type":"door|window","center":[x,y],"confidence":0..1}]}. '
+            'Also return "grid":{"x":[pixel positions],"y":[pixel positions]} and '
+            '"elements":[{"id":string,"kind":string,"category":"structural|circulation|safety|mep|other",'
+            '"label":string,"center":[x,y],"bbox":[x0,y0,x1,y1],"confidence":0..1}]. '
+            "Include commercial spaces and features when visible: offices, tenant areas, corridors, lobbies, "
+            "stairs, fire-escape stairs, lift banks, shafts, service/electrical rooms, fire command centres, "
+            "refuge areas, compartments and exits. Preserve exact visible labels. Do not assume residential "
+            "space types or invent features from the building profile. Include only structural walls, not "
+            "furniture, dimension lines, text underlines, or room contents. "
+            f"image_size=[{width},{height}]. Building profile context="
+            + json.dumps(self.building_profile)
+        )
+        self.plan_spec = self._qwen_json(rgb, prompt, max_tokens=1800)
+        status = str(self.plan_spec.get("status", "insufficient"))
+        self.audit.specification_status = status if status in {"usable", "insufficient"} else "insufficient"
+        self.audit.specification_confidence = _bounded_confidence(self.plan_spec.get("confidence", 0))
+        self.audit.specification_summary = str(self.plan_spec.get("summary", ""))[:500]
+        return self.plan_spec
+
+    def _capture_review(self, payload: dict, initial: bool) -> None:
         review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
         status = str(review.get("status", "insufficient"))
-        self.audit.review_status = status if status in {"approved", "needs_correction", "insufficient"} else "insufficient"
-        self.audit.review_confidence = max(0.0, min(float(review.get("confidence", 0)), 1.0))
+        status = status if status in {"approved", "needs_correction", "insufficient"} else "insufficient"
+        if initial:
+            self.audit.initial_review_status = status
+        self.audit.review_status = status
+        self.audit.review_confidence = _bounded_confidence(review.get("confidence", 0))
         self.audit.review_summary = str(review.get("summary", ""))[:500]
         self.audit.discrepancies = list(review.get("discrepancies") or [])[:50]
-        return apply_guidance(model, payload, self.audit)
 
     def _request(self, rgb: np.ndarray, model: FloorplanModel) -> dict:
-        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
-        if not ok:
-            raise RuntimeError("could not encode plan image")
-        image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
         compact = {
             "image_size": list(model.image_size),
             "walls": [{"id": w.id, "start": w.start, "end": w.end} for w in model.walls],
@@ -74,6 +139,13 @@ class QwenTopologyGuide:
             "\"add_windows\":[same],\"room_labels\":[{\"room_id\":str,\"label\":str,\"type\":str,"
             "\"confidence\":0..1}]}. Omit uncertain proposals. Extracted topology: " + json.dumps(compact)
         )
+        return self._qwen_json(rgb, prompt, max_tokens=1800)
+
+    def _qwen_json(self, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
+        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            raise RuntimeError("could not encode plan image")
+        image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
         result = None
         for attempt in range(2):
             attempt_prompt = prompt
@@ -91,7 +163,7 @@ class QwenTopologyGuide:
                 "temperature": 0.7,
                 "top_p": 0.8,
                 "presence_penalty": 1.5,
-                "max_completion_tokens": 1800,
+                "max_completion_tokens": max_tokens,
                 "reasoning_effort": "none",
                 "response_format": {"type": "json_object"},
                 "stream": False,
@@ -121,6 +193,13 @@ class QwenTopologyGuide:
             raise RuntimeError("Qwen request failed after JSON validation retry")
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
         return json.loads(content)
+
+
+def _bounded_confidence(value) -> float:
+    try:
+        return max(0.0, min(float(value), 1.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _provider_error_message(error: urllib.error.HTTPError) -> str:

@@ -12,6 +12,7 @@
     "ALLOWED_ORIGINS": "https://thevikram123.github.io,http://localhost:8787,http://localhost:5000",
     "GROQ_VISION_MODEL": "qwen/qwen3.6-27b",
     "GROQ_REASON_MODEL": "openai/gpt-oss-120b",
+    "GROQ_LIGHT_MODEL": "openai/gpt-oss-20b",
     "FLOORPLAN_SERVICE_URL": "https://fireshield-floorplan-api.onrender.com",
     "NBC_INDEX_KEY": "nbc_query_index"
   },

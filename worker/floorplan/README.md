@@ -1,13 +1,3 @@
----
-title: FireShield Floor Plan Processor
-emoji: "🔥"
-colorFrom: red
-colorTo: yellow
-sdk: docker
-app_port: 8080
-pinned: false
----
-
 # floorplan2dxf
 
 Working proof of a **semantic** floor-plan raster → DXF pipeline:
@@ -39,7 +29,15 @@ python -m floorplan2dxf demo --out-dir out
 python -m floorplan2dxf convert samples\synthetic_plan.png --out out\plan.dxf
 python -m floorplan2dxf convert "samples\hard example.png" --out out\hard_example.dxf --overall 40ft,30ft
 python -m floorplan2dxf convert scan.pdf --page 0 --dpi 200 --overall 18m,12m --out out\plan.dxf
+python -m floorplan2dxf convert samples\synthetic_plan.png --vision-first `
+  --audit-json out\plan_audit.json --machine-readable
 ```
+
+`--vision-first` asks Qwen to specify rooms and structural walls before OpenCV
+reconstruction, then reviews the result. OpenRouter/Gemma is used only when the
+review reports a mismatch; GPT-OSS 120B is the text-only correction fallback.
+Use `--no-ai-correction` to inspect specification + review without spending the
+limited OpenRouter free-model quota.
 
 `--overall` is the printed size **on that drawing** (any units). Nothing in the engine is hardcoded to one plan. If OCR is installed, room sizes like `9'-0" x 12'-0"` are also used for scale.
 
