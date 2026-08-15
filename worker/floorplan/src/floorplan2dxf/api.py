@@ -78,6 +78,15 @@ async def convert_plan(
             source = work / f"source{suffix}"
             source.write_bytes(payload)
             dxf = work / "plan.dxf"
+            # Qwen stream: a separate, parallel advisory read of the same image.
+            # Run it first so its dimension-label reads are available as a scale
+            # fallback below. It still never touches wall/room topology — only
+            # the scalar pixel-to-mm factor, which is applied uniformly after
+            # geometry is already fixed.
+            vision_advisory = _qwen_advisory(
+                source, page, groq_api_key, profile) if require_qwen else {"status": "disabled"}
+            vision_dimensions = vision_advisory.pop("_dimensions", None)
+            vision_overall_mm = vision_advisory.pop("_overallMm", None)
             # Geometry stream: always deterministic. OpenCV tracing is the sole
             # geometry authority; no vision model may replace or edit the DXF.
             result = convert(
@@ -90,12 +99,9 @@ async def convert_plan(
                 ocr=os.environ.get("ENABLE_EASYOCR_RUNTIME") == "1",
                 guide=None,
                 guide_required=False,
+                vision_dimensions=vision_dimensions,
+                vision_overall_mm=vision_overall_mm,
             )
-            # Qwen stream: a separate, parallel advisory read of the same image.
-            # It enriches the reasoning context (space labels, visible safety
-            # features) but never touches the traced geometry above.
-            vision_advisory = _qwen_advisory(
-                source, page, groq_api_key, profile) if require_qwen else {"status": "disabled"}
             json_path = result.json_path
             overlay_path = result.overlay_path
             return {
@@ -172,7 +178,24 @@ def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) 
             for item in list(spec.get("elements") or [])[:80]
             if isinstance(item, dict)
         ],
+        # Popped by the caller before this dict reaches the client response —
+        # internal handoff for scale calibration only, not part of the advisory
+        # contract the app/reasoning model sees.
+        "_dimensions": [
+            item for item in list(spec.get("dimensions") or [])[:200]
+            if isinstance(item, dict)
+        ],
+        "_overallMm": _overall_mm_from_spec(spec),
     }
+
+
+def _overall_mm_from_spec(spec: dict) -> tuple[float, float] | None:
+    try:
+        w = float(spec.get("overall_width_m") or 0) * 1000.0
+        h = float(spec.get("overall_height_m") or 0) * 1000.0
+    except (TypeError, ValueError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
 
 
 def _artifact(path: Path, mime: str) -> dict:

@@ -27,14 +27,28 @@ const GROQ_BASE = 'https://api.groq.com/openai/v1';
 const MAX_JSON_BYTES = 48_000;
 const MAX_VISION_BYTES = 22 * 1024 * 1024; // 5 images * ~4MB + JSON overhead
 const MAX_TOOL_HOPS = 4;
-const PLAN_GUIDANCE_QUERIES = [
-  'means of egress number of exits travel distance exit width occupant load',
-  'staircase minimum width number of stairways fire escape pressurization',
-  'fire compartment compartmentation fire door protected shaft',
-  'emergency lighting exit signage escape route floor plan',
-  'automatic detection sprinkler wet riser hydrant Table 7 occupancy height area',
-  'refuge area accessible means of egress high rise building',
-];
+const PLAN_MAX_TOOL_HOPS = 3;
+const NBC_QUERY_TOOL = {
+  type: 'function',
+  function: {
+    name: 'query_nbc',
+    description:
+      'Query the NBCS 2026 Part F fire-safety graph for the requirement text, '
+      + 'protection matrix (Table 7), spacing/coverage rules and IS references '
+      + 'relevant to a system, occupancy, clause, or a specific measured condition '
+      + '(e.g. an exact corridor width, exit count, or travel distance from the '
+      + 'geometry). Call it for every system or measurement your evidence implicates '
+      + 'before concluding.',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'natural-language regulation question' },
+        seed_terms: { type: 'string', description: 'optional extra keywords to focus the search' },
+      },
+      required: ['question'],
+    },
+  },
+};
 const VISUAL_GUIDANCE_QUERIES = {
   extinguisher: 'fire extinguisher requirement inspection installation Table 7',
   sprinkler: 'automatic wet sprinkler requirement sprinkler heads inspection',
@@ -180,43 +194,73 @@ async function convertFloorplan(request, env, cors, groqKey) {
 }
 
 async function assessFloorplan(converted, env, apiKey) {
-  const guidance = await Promise.all(PLAN_GUIDANCE_QUERIES.map(async (question) => {
-    try {
-      const result = await queryNbc(env, question, { k: 3, hops: 1 });
-      return {
-        question,
-        results: result.results.map((item) => ({
-          id: String(item.id || '').slice(0, 100),
-          label: String(item.label || '').slice(0, 180),
-          page: Number.isFinite(Number(item.page)) ? Number(item.page) : null,
-          rationale: String(item.rationale || '').slice(0, 240),
-          snippet: String(item.snippet || '').slice(0, 300),
-        })),
-      };
-    } catch {
-      return { question, error: 'NBCS guidance lookup failed' };
-    }
-  }));
+  // A fixed set of generic topic buckets can't answer a question tailored to
+  // this building's actual measured geometry (a specific corridor width, exit
+  // count, travel distance). Give gpt-oss the same query_nbc tool the site/photo
+  // audit already uses so it looks up the exact clause for what it measures,
+  // instead of reasoning only over whatever six static queries happened to return.
   const plan = compactPlanForReasoning(converted);
-  const reasoningContext = fitPlanReasoningContext(plan, guidance);
-  const payload = {
+  const messages = [
+    { role: 'system', content: PLAN_REASON_SYSTEM },
+    { role: 'user', content: fitPlanReasoningContext(plan, []) },
+  ];
+
+  for (let hop = 0; hop < PLAN_MAX_TOOL_HOPS; hop++) {
+    const payload = {
+      model: env.GROQ_REASON_MODEL,
+      messages,
+      tools: [NBC_QUERY_TOOL],
+      tool_choice: 'auto',
+      temperature: 0.2,
+      max_completion_tokens: 900,
+      reasoning_effort: 'low',
+      include_reasoning: false,
+    };
+    let data = await callGroq(apiKey, payload);
+    if (data.error && hop === 0 && env.GROQ_LIGHT_MODEL) {
+      data = await callGroq(apiKey, { ...payload, model: env.GROQ_LIGHT_MODEL });
+    }
+    if (data.error) return data;
+
+    const msg = data.json?.choices?.[0]?.message;
+    if (!msg) return { error: 'GPT-OSS returned an empty response', status: 502, headers: {} };
+    messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
+
+    if (!msg.tool_calls || msg.tool_calls.length === 0) break;
+    for (const call of msg.tool_calls) {
+      let args = {};
+      try { args = JSON.parse(call.function.arguments || '{}'); } catch { /* ignore */ }
+      let result;
+      try {
+        result = await queryNbc(env, String(args.question || ''), {
+          seedTerms: String(args.seed_terms || ''), k: 3, hops: 1,
+        });
+      } catch (e) {
+        result = { error: 'nbc query failed', detail: String(e.message || e) };
+      }
+      messages.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content: JSON.stringify(result).slice(0, 4000),
+      });
+    }
+  }
+
+  const finalData = await callGroq(apiKey, {
     model: env.GROQ_REASON_MODEL,
-    messages: [
-      { role: 'system', content: PLAN_REASON_SYSTEM },
-      { role: 'user', content: reasoningContext },
-    ],
+    messages: [...messages, {
+      role: 'user',
+      content: 'Now output the final compliance assessment as JSON only, matching the schema.',
+    }],
+    tool_choice: 'none',
     temperature: 0.2,
     max_completion_tokens: 1600,
     reasoning_effort: 'low',
     include_reasoning: false,
     response_format: PLAN_RESPONSE_FORMAT,
-  };
-  let data = await callGroq(apiKey, payload);
-  if (data.error && env.GROQ_LIGHT_MODEL) {
-    data = await callGroq(apiKey, { ...payload, model: env.GROQ_LIGHT_MODEL });
-  }
-  if (data.error) return data;
-  const value = safeJson(data.json?.choices?.[0]?.message?.content);
+  });
+  if (finalData.error) return finalData;
+  const value = safeJson(finalData.json?.choices?.[0]?.message?.content);
   if (!value || !Array.isArray(value.findings)) {
     return { error: 'GPT-OSS returned an invalid plan assessment', status: 502, headers: {} };
   }
@@ -584,28 +628,6 @@ async function groqReason(request, env, cors, apiKey) {
     }
   }));
 
-  const tools = [{
-    type: 'function',
-    function: {
-      name: 'query_nbc',
-      description:
-        'Query the NBCS 2026 Part F fire-safety graph for the requirement text, '
-        + 'protection matrix (Table 7), spacing/coverage rules and IS references '
-        + 'relevant to a system, occupancy or clause. Call once per system you must '
-        + 'assess (extinguishers, sprinklers, detection/alarm, hydrant/wet-riser, '
-        + 'exit signage & emergency lighting, fire doors, fire pumps/inlets, kitchen '
-        + 'suppression, evacuation information, refuge/compartmentation).',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: 'natural-language regulation question' },
-          seed_terms: { type: 'string', description: 'optional extra keywords to focus the search' },
-        },
-        required: ['question'],
-      },
-    },
-  }];
-
   const messages = [
     { role: 'system', content: REASON_SYSTEM },
     { role: 'user', content: fitReasonContext({
@@ -622,7 +644,7 @@ async function groqReason(request, env, cors, apiKey) {
     const data = await callGroq(apiKey, {
       model: env.GROQ_REASON_MODEL,
       messages,
-      tools,
+      tools: [NBC_QUERY_TOOL],
       tool_choice: 'auto',
       temperature: 0.3,
       max_completion_tokens: 1500,
@@ -692,7 +714,13 @@ async function nbcQueryRoute(request, env, cors) {
 }
 
 // ── Groq call helper ─────────────────────────────────────────────────────────
-async function callGroq(apiKey, payload) {
+const MAX_RATE_LIMIT_WAIT_MS = 25_000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function callGroq(apiKey, payload, { retriedAfterRateLimit = false } = {}) {
   const upstream = await fetch(`${GROQ_BASE}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -704,6 +732,17 @@ async function callGroq(apiKey, payload) {
     const detail = body?.error && typeof body.error === 'object' ? body.error : {};
     const code = String(detail.code || detail.type || '').slice(0, 100);
     const message = String(detail.message || '').slice(0, 500);
+    // Groq's 429 for a short-lived per-minute token/request budget is a normal,
+    // expected condition (multiple audit phases can land in the same window) —
+    // not a hard failure. Honour its own Retry-After and retry once rather than
+    // bubbling a 429 straight to the UI.
+    if (upstream.status === 429 && !retriedAfterRateLimit) {
+      const waitMs = Math.round(parseFloat(upstream.headers.get('retry-after') || '0') * 1000);
+      if (waitMs > 0 && waitMs <= MAX_RATE_LIMIT_WAIT_MS) {
+        await sleep(waitMs);
+        return callGroq(apiKey, payload, { retriedAfterRateLimit: true });
+      }
+    }
     // Server-log only diagnostic: never returned to the client. Helps debug
     // json_validate_failed (Groq includes the model's raw non-JSON output here).
     console.error(JSON.stringify({ message: 'Groq call failed', status: upstream.status, model: payload.model, code }));
@@ -772,7 +811,13 @@ const PLAN_REASON_SYSTEM =
   + 'deterministically from the drawing and is the authoritative geometric evidence — always reason over it. '
   + '`visionAdvisory` is a SEPARATE Qwen visual stream: use it only as supporting context for space labels and '
   + 'visible safety features; it is advisory and never overrides or invalidates the geometry. '
-  + 'Use only the supplied NBCS guidance for regulatory requirements and cite its page and clause identifiers. '
+  + 'Identify which fire-safety systems and life-safety checks this specific geometry implicates (exit count and '
+  + 'width, travel distance, corridor width, compartmentation, detection/sprinkler coverage, refuge area, etc.), '
+  + 'then use the query_nbc tool to fetch the exact NBCS requirement for each — including a specific measured '
+  + 'value from the geometry when relevant (e.g. query the minimum corridor width for this occupancy, then '
+  + 'compare it against the measured width). Never invent a clause id, page, or numeric threshold: only cite '
+  + 'what a tool result returned. Call query_nbc for every check before concluding; a check with no tool result '
+  + 'to support it must be cannot_verify. '
   + 'Never infer occupancy, door purpose, exit designation, fire rating, or protection equipment the structured '
   + 'plan does not establish. When assessmentMode is verified_geometry, printed scale was recovered: reason over '
   + 'absolute widths, areas and travel distances. When assessmentMode is geometry_unscaled, the geometry is '

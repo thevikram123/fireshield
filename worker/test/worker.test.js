@@ -120,6 +120,70 @@ test('floorplan conversion calls protected Qwen service then GPT-OSS NBCS assess
   assert.equal(groqPayload.reasoning_effort, 'low');
 });
 
+test('plan compliance can query_nbc for a specific measured condition before concluding', async (t) => {
+  const groqCalls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url) === 'https://floorplan.test/convert') {
+      return Response.json({
+        buildingProfile: { occupancy: 'Business' },
+        topology: {
+          units: 'mm', mm_per_px: 10,
+          walls: [{ id: 'w0', start: [0, 0], end: [900, 0] }],
+          rooms: [{ id: 'r0', type: 'CORRIDOR', boundary: [[0, 0], [900, 0], [900, 100], [0, 100]] }],
+          room_graph: { nodes: [], edges: [] },
+        },
+        metrics: { walls: 1, rooms: 1 }, artifacts: {},
+      });
+    }
+    const payload = JSON.parse(options.body);
+    groqCalls.push(payload);
+    if (groqCalls.length === 1) {
+      // First hop: the model asks for the exact corridor-width threshold
+      // instead of reasoning over a fixed static bucket.
+      return Response.json({
+        choices: [{ message: {
+          content: '',
+          tool_calls: [{
+            id: 'call_1',
+            function: { name: 'query_nbc', arguments: JSON.stringify({ question: 'minimum corridor width Business occupancy' }) },
+          }],
+        } }],
+      });
+    }
+    // Second hop (no further tool calls) and the forced final strict-schema
+    // call both land here; either way, the final call must carry the findings.
+    return Response.json({
+      choices: [{ message: { content: JSON.stringify({
+        planSummary: 'Corridor width checked against the queried threshold.',
+        score: 80,
+        findings: [{
+          check: 'Corridor width', status: 'compliant', severity: 'minor',
+          observed: 'Corridor measured 900mm wide', required: 'Per queried clause',
+          measurementEvidence: '900mm', clauseId: '', page: null,
+          rationale: 'Measured corridor width meets the queried minimum.',
+        }],
+        citedClauses: [], limitations: [],
+      }) } }],
+    });
+  });
+  const form = new FormData();
+  form.append('file', new Blob(['plan'], { type: 'image/png' }), 'plan.png');
+  const response = await worker.fetch(new Request('https://worker.test/plan/convert', {
+    method: 'POST', headers: { Origin: origin }, body: form,
+  }), env());
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.compliance.findings[0].status, 'compliant');
+  // Tool-requesting hop, second hop, then the forced strict-schema final call.
+  assert.equal(groqCalls.length, 3);
+  assert.ok(groqCalls[0].tools.some((tool) => tool.function.name === 'query_nbc'));
+  const final = groqCalls[groqCalls.length - 1];
+  assert.equal(final.tool_choice, 'none');
+  assert.equal(final.response_format.type, 'json_schema');
+  // The tool result (even if empty) must have round-tripped back as a tool message.
+  assert.ok(final.messages.some((m) => m.role === 'tool'));
+});
+
 test('a non-approving Qwen advisory never strips the deterministic geometry', async (t) => {
   let groqPayload;
   t.mock.method(globalThis, 'fetch', async (url, options) => {
@@ -184,6 +248,42 @@ test('reasoning reserves five model-call units and returns 429 before Groq', asy
   assert.equal(response.status, 429);
   assert.equal(calls, 4);
   assert.equal(response.headers.get('retry-after'), '60');
+});
+
+test('a Groq 429 with a short Retry-After is retried once instead of failing the request', async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    if (calls === 1) {
+      return new Response(JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'slow down' } }), {
+        status: 429, headers: { 'retry-after': '0.01' },
+      });
+    }
+    return Response.json({ choices: [{ message: { content: 'ok after retry' } }] });
+  });
+  const response = await worker.fetch(
+    post('/groq/chat', { messages: [{ role: 'user', content: 'hello' }] }),
+    env(),
+  );
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).content, 'ok after retry');
+  assert.equal(calls, 2);
+});
+
+test('a Groq 429 with no usable Retry-After surfaces immediately, no retry', async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    return new Response(JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'slow down' } }), {
+      status: 429, headers: {},
+    });
+  });
+  const response = await worker.fetch(
+    post('/groq/chat', { messages: [{ role: 'user', content: 'hello' }] }),
+    env(),
+  );
+  assert.equal(response.status, 429);
+  assert.equal(calls, 1);
 });
 
 test('disallowed origins are rejected before consuming a limiter unit', async () => {

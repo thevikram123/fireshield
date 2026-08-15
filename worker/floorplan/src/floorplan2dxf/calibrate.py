@@ -177,6 +177,65 @@ def calibrate_from_span(width_px: float, height_px: float, overall_mm: tuple[flo
     return _median(scales)
 
 
+def calibrate_from_wall_dimensions(
+    dimensions: Iterable[dict],
+    walls: Iterable,
+    *,
+    proximity_px: float,
+) -> Optional[float]:
+    """Snap each vision-read dimension label to its nearest matching traced wall
+    segment and take the median implied scale. EasyOCR is unavailable at runtime
+    (Render memory limit), so Qwen reads the printed labels; the geometry itself
+    stays deterministic — this only derives the pixel-to-mm scale factor, never
+    wall/room topology. Robust to a handful of misread or mismatched labels
+    because the median tolerates outliers where a single overall reading can't.
+    """
+    walls = list(walls)
+    ratios: list[float] = []
+    for dim in dimensions:
+        try:
+            value_mm = float(dim.get("value_m") or 0) * 1000.0
+            x, y = (float(v) for v in dim["position"])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        if value_mm < 100:
+            continue
+        horizontal = str(dim.get("orientation", "")).lower() == "horizontal"
+        best_wall = None
+        best_dist = None
+        for wall in walls:
+            try:
+                wx1, wy1 = wall.start
+                wx2, wy2 = wall.end
+            except (TypeError, ValueError):
+                continue
+            wall_horizontal = abs(wx2 - wx1) >= abs(wy2 - wy1)
+            if wall_horizontal != horizontal:
+                continue
+            length_px = math.hypot(wx2 - wx1, wy2 - wy1)
+            if length_px < 4:
+                continue
+            if horizontal:
+                if not (min(wx1, wx2) - proximity_px <= x <= max(wx1, wx2) + proximity_px):
+                    continue
+                dist = abs(y - (wy1 + wy2) / 2.0)
+            else:
+                if not (min(wy1, wy2) - proximity_px <= y <= max(wy1, wy2) + proximity_px):
+                    continue
+                dist = abs(x - (wx1 + wx2) / 2.0)
+            if dist > proximity_px:
+                continue
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_wall = (wall, length_px)
+        if best_wall is not None:
+            _, length_px = best_wall
+            ratios.append(value_mm / length_px)
+    if len(ratios) < 2:
+        return None
+    return _median(ratios)
+
+
 def standalone_lengths_mm(texts: Iterable[TextItem]) -> list[float]:
     texts = list(texts)
     metric_drawing = any(

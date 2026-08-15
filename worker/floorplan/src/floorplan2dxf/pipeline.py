@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .calibrate import calibrate_auto, parse_overall
+from .calibrate import calibrate_auto, calibrate_from_span, calibrate_from_wall_dimensions, parse_overall
 from .commercial_model import build_commercial_model
 from .correction import constrain_geometry_to_spec
 from .export_dxf import write_dxf
@@ -51,6 +51,8 @@ def convert(
     use_model: bool = True,
     guide: Optional[Callable] = None,
     guide_required: bool = False,
+    vision_dimensions: Optional[list[dict]] = None,
+    vision_overall_mm: Optional[tuple[float, float]] = None,
 ) -> ConvertResult:
     warnings: list[str] = []
     src = Path(path)
@@ -142,6 +144,26 @@ def convert(
         bar_h_px=bar_h,
         bar_v_px=bar_v,
     )
+    if scale is None and vision_dimensions:
+        # EasyOCR is disabled at runtime (Render memory limit); Qwen reads the
+        # printed dimension labels instead. Snapping each label to its nearest
+        # matching wall segment (below) and never letting Qwen touch wall/room
+        # topology keeps geometry deterministic while still recovering scale.
+        proximity_px = max(10.0, max(*prep.display_rgb.shape[:2]) * 0.03)
+        scale = calibrate_from_wall_dimensions(vision_dimensions, cv_geom.walls, proximity_px=proximity_px)
+        if scale is not None:
+            warnings.append(
+                "Scale recovered from vision-read dimension labels matched to traced walls "
+                "(advisory — EasyOCR unavailable at runtime)."
+            )
+    if scale is None and vision_overall_mm and cv_geom.envelope:
+        x0, y0, x1, y1 = cv_geom.envelope
+        scale = calibrate_from_span(x1 - x0, y1 - y0, vision_overall_mm)
+        if scale is not None:
+            warnings.append(
+                "Scale recovered from a vision-read overall building dimension "
+                "(advisory — EasyOCR unavailable at runtime)."
+            )
     if scale is None:
         warnings.append(
             "Could not infer scale from printed dimensions. DXF stays in pixel units. "

@@ -103,6 +103,17 @@ class QwenTopologyGuide:
             "refuge areas, compartments and exits. Preserve exact visible labels. Do not assume residential "
             "space types or invent features from the building profile. Include only structural walls, not "
             "furniture, dimension lines, text underlines, or room contents. "
+            'Also read every printed dimension label so real-world measurements can be recovered (EasyOCR is '
+            'not available at runtime, so this vision read is the only source for it). Return '
+            '"dimensions":[{"value_m":number,"orientation":"horizontal|vertical","position":[x,y]}] — one '
+            'entry per printed dimension number along the dimension lines (e.g. each segment like "2.00", '
+            '"4.00", "3.00" on a wall run, not just the overall total). "position" is the pixel location of '
+            'that label, placed near the wall segment it measures. "orientation" is horizontal for a '
+            'width/length label, vertical for a height/depth label. Convert feet/inches labels to metres. '
+            'Read as many dimension labels as are legibly printed; omit ones you cannot read confidently. Also '
+            'return "overall_width_m":number,"overall_height_m":number set to the printed OUTER envelope '
+            'dimension labels in metres (the outermost total, not a single room). Set both to 0 if no explicit '
+            'overall total is printed — never estimate or guess a value. '
             f"image_size=[{width},{height}]. Building profile context="
             + json.dumps(self.building_profile)
         )
