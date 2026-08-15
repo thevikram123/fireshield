@@ -7,10 +7,14 @@ no browser CORS policy and no embedded provider credentials.
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import hmac
 import json
 import os
 import tempfile
+import time
+from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -83,8 +87,9 @@ async def convert_plan(
             # fallback below. It still never touches wall/room topology — only
             # the scalar pixel-to-mm factor, which is applied uniformly after
             # geometry is already fixed.
-            vision_advisory = _qwen_advisory(
-                source, page, groq_api_key, profile) if require_qwen else {"status": "disabled"}
+            vision_advisory = _cached_qwen_advisory(
+                payload, source, page, groq_api_key, profile,
+            ) if require_qwen else {"status": "disabled"}
             vision_dimensions = vision_advisory.pop("_dimensions", None)
             vision_overall_mm = vision_advisory.pop("_overallMm", None)
             # Geometry stream: always deterministic. OpenCV tracing is the sole
@@ -131,6 +136,47 @@ async def convert_plan(
         raise
     except Exception as exc:
         raise HTTPException(422, f"Plan conversion failed: {exc}") from exc
+
+
+#: Vision reads are billed against a tokens-per-DAY budget that a handful of
+#: repeat conversions can exhaust, which disables the advisory stream entirely
+#: (no space labels, no openings, no printed-dimension read, so no scale). The
+#: same drawing always yields the same read, so re-analysing it should cost
+#: nothing. Kept small and short-lived: the service runs under a 512MB limit,
+#: and a stale read of an edited drawing would be worse than paying again.
+_ADVISORY_TTL_SECONDS = 30 * 60
+_ADVISORY_CACHE_MAX = 24
+_ADVISORY_CACHE: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+
+
+def _cached_qwen_advisory(
+    payload: bytes, source: Path, page: int, api_key: str | None, profile: dict,
+) -> dict:
+    """Reuse a previous vision read of the identical drawing.
+
+    Keyed by the bytes of the upload, so any edit to the drawing misses the
+    cache. Failures are never cached — caching a rate-limit error would keep
+    the advisory dead long after the quota recovered.
+    """
+    key = hashlib.sha256(payload).hexdigest()
+    key = f"{key}:{page}"
+    now = time.monotonic()
+    cached = _ADVISORY_CACHE.get(key)
+    if cached is not None:
+        stored_at, advisory = cached
+        if now - stored_at <= _ADVISORY_TTL_SECONDS:
+            _ADVISORY_CACHE.move_to_end(key)
+            # Deep-copied because the caller pops private keys off the result.
+            return copy.deepcopy(advisory)
+        del _ADVISORY_CACHE[key]
+
+    advisory = _qwen_advisory(source, page, api_key, profile)
+    if advisory.get("status") in {"usable", "insufficient"}:
+        _ADVISORY_CACHE[key] = (now, copy.deepcopy(advisory))
+        _ADVISORY_CACHE.move_to_end(key)
+        while len(_ADVISORY_CACHE) > _ADVISORY_CACHE_MAX:
+            _ADVISORY_CACHE.popitem(last=False)
+    return advisory
 
 
 def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) -> dict:
