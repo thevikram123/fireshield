@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import base64
 import json
+import re
+import time
 import urllib.error
 import urllib.request
 
 import cv2
 import numpy as np
 
-from .schema import FloorplanModel, Wall
+from .schema import FloorplanModel, Room, Wall
 
 
 QWEN_VISION_MODEL = "qwen/qwen3.6-27b"
@@ -54,13 +56,14 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
             score = perpendicular / scale + 0.15 * along / scale + 0.05 * (1 - overlap)
             if score < best_score:
                 best, best_score = wall, score
-        support = _wall_support(rgb, start, end, best.thickness_mm if best else 8) if rgb is not None else 1.0
-        if best is not None and best_score <= 0.075 and support >= 0.18:
+        support = (_wall_support(rgb, best.start, best.end, best.thickness_mm)
+                   if rgb is not None and best is not None else 1.0)
+        if best is not None and best_score <= 0.10 and support >= 0.18:
             wall_type = str(target.get("kind", "unknown")) if target.get("kind") in {
                 "external", "internal"
             } else "unknown"
             snapped = Wall(
-                id=best.id, start=start, end=end,
+                id=best.id, start=best.start, end=best.end,
                 thickness_mm=best.thickness_mm, wall_type=wall_type,
             )
             if not any(_same_segment(snapped.start, snapped.end, item.start, item.end, 5)
@@ -111,6 +114,18 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
                     pass
             selected_rooms.append(room)
             used.add(best_i)
+        elif isinstance(target.get("bbox"), (list, tuple)) and len(target["bbox"]) == 4:
+            try:
+                x0, y0, x1, y1 = map(float, target["bbox"])
+                if 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height:
+                    selected_rooms.append(Room(
+                        id=f"room_{len(selected_rooms)}",
+                        type=str(target.get("type", "UNDEFINED"))[:40].upper(),
+                        label=str(target.get("label", ""))[:80] or None,
+                        boundary=[(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+                    ))
+            except (TypeError, ValueError):
+                pass
     if selected_rooms:
         cv_geom.rooms = selected_rooms
 
@@ -313,7 +328,10 @@ def _correction_prompt(model: FloorplanModel, discrepancies: list[dict]) -> str:
     )
 
 
-def _post_json(url: str, api_key: str, payload: dict, extra_headers: dict | None = None) -> dict:
+def _post_json(
+    url: str, api_key: str, payload: dict, extra_headers: dict | None = None,
+    rate_limit_retries: int = 1,
+) -> dict:
     headers = {
         "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
         "Accept": "application/json", "User-Agent": "FireShield-Floorplan/1.0",
@@ -329,6 +347,14 @@ def _post_json(url: str, api_key: str, payload: dict, extra_headers: dict | None
             message = str(detail.get("message", ""))[:500]
         except (json.JSONDecodeError, OSError, AttributeError):
             message = ""
+        if exc.code == 429 and rate_limit_retries > 0:
+            match = re.search(r"try again in\s+([0-9.]+)s", message, re.I)
+            delay = min(50.0, max(2.0, float(match.group(1)) + 1.0 if match else 20.0))
+            time.sleep(delay)
+            return _post_json(
+                url, api_key, payload, extra_headers,
+                rate_limit_retries=rate_limit_retries - 1,
+            )
         raise RuntimeError(f"correction model failed ({exc.code}){': ' + message if message else ''}") from exc
 
 
