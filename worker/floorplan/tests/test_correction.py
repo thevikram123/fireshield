@@ -2,6 +2,7 @@ import numpy as np
 
 from floorplan2dxf.correction import apply_corrections, constrain_geometry_to_spec
 from floorplan2dxf.geometry import CvGeometry
+from floorplan2dxf.guidance import review_against_spec
 from floorplan2dxf.schema import FloorplanModel, Room, Wall
 
 
@@ -50,3 +51,23 @@ def test_vision_spec_suppresses_unmatched_hough_lines_and_matches_rooms():
         ("Bedroom", "BEDROOM"), ("Kitchen", "KITCHEN"),
     ]
 
+
+def test_single_vision_spec_approves_matching_python_topology_and_flags_mismatch():
+    model = FloorplanModel(
+        image_size=(100, 100),
+        walls=[Wall("divider", (50, 0), (50, 99), 5)],
+        rooms=[Room("office", "OFFICE", [(0, 0), (49, 0), (49, 99), (0, 99)])],
+    )
+    spec = {
+        "status": "usable", "confidence": 0.9,
+        "major_walls": [{"start": [50, 0], "end": [50, 99], "confidence": 0.95}],
+        "spaces": [{"label": "Office", "center": [25, 50], "confidence": 0.9}],
+    }
+    approved = review_against_spec(spec, model)["review"]
+    assert approved["status"] == "approved"
+    assert approved["summary"].startswith("Matched 2/2")
+    spec["major_walls"].append({"start": [10, 0], "end": [10, 99], "confidence": 0.95})
+    spec["spaces"].append({"label": "Lobby", "center": [90, 50], "confidence": 0.9})
+    mismatch = review_against_spec(spec, model)["review"]
+    assert mismatch["status"] == "needs_correction"
+    assert len(mismatch["discrepancies"]) == 2

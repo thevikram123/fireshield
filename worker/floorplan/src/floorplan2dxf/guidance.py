@@ -38,7 +38,7 @@ class GuidanceAudit:
 
 
 class QwenTopologyGuide:
-    """Ask Qwen to identify omissions, then apply only safe geometric additions."""
+    """Use one Qwen vision specification, then validate reconstruction against it."""
 
     def __init__(self, api_key: str | None = None, model: str = "qwen/qwen3.6-27b",
                  openrouter_api_key: str | None = None, enable_correction: bool = True,
@@ -54,9 +54,8 @@ class QwenTopologyGuide:
             raise RuntimeError("GROQ_API_KEY is not configured")
 
     def __call__(self, rgb: np.ndarray, model: FloorplanModel) -> FloorplanModel:
-        payload = self._request(rgb, model)
+        payload = review_against_spec(self.plan_spec, model)
         self._capture_review(payload, initial=True)
-        model = apply_guidance(model, payload, self.audit)
         if self.audit.review_status != "needs_correction" or not self.enable_correction:
             if self.audit.review_status == "needs_correction" and not self.enable_correction:
                 self.audit.correction_status = "disabled"
@@ -70,9 +69,8 @@ class QwenTopologyGuide:
                 item.get("kind") in {"remove_wall", "replace_wall", "add_wall"}
                 for item in self.audit.accepted
             ) else "no_valid_operations"
-            revised = self._request(rgb, model)
+            revised = review_against_spec(self.plan_spec, model)
             self._capture_review(revised, initial=False)
-            model = apply_guidance(model, revised, self.audit)
         except Exception as exc:
             self.audit.correction_status = "failed"
             self.audit.rejected.append({"kind": "correction_stage", "reason": str(exc)[:500]})
@@ -101,7 +99,7 @@ class QwenTopologyGuide:
             f"image_size=[{width},{height}]. Building profile context="
             + json.dumps(self.building_profile)
         )
-        self.plan_spec = self._qwen_json(rgb, prompt, max_tokens=1800)
+        self.plan_spec = _qwen_json(self.api_key, self.model, rgb, prompt, max_tokens=1800)
         status = str(self.plan_spec.get("status", "insufficient"))
         self.audit.specification_status = status if status in {"usable", "insufficient"} else "insufficient"
         self.audit.specification_confidence = _bounded_confidence(self.plan_spec.get("confidence", 0))
@@ -139,9 +137,83 @@ class QwenTopologyGuide:
             "\"add_windows\":[same],\"room_labels\":[{\"room_id\":str,\"label\":str,\"type\":str,"
             "\"confidence\":0..1}]}. Omit uncertain proposals. Extracted topology: " + json.dumps(compact)
         )
-        return self._qwen_json(rgb, prompt, max_tokens=1800)
+        return _qwen_json(self.api_key, self.model, rgb, prompt, max_tokens=1800)
 
-    def _qwen_json(self, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
+
+def review_against_spec(spec: dict, model: FloorplanModel) -> dict:
+    """Measure Python topology against Qwen's pixel-coordinate target without another vision call."""
+    if not isinstance(spec, dict) or spec.get("status") != "usable":
+        return {"review": {"status": "insufficient",
+                           "confidence": _bounded_confidence(spec.get("confidence", 0) if isinstance(spec, dict) else 0),
+                           "summary": "Vision specification was insufficient for geometry approval.",
+                           "discrepancies": []}}
+    width, height = model.image_size
+    tolerance = max(8.0, max(width, height) * 0.025)
+    walls = [item for item in list(spec.get("major_walls") or [])
+             if _bounded_confidence(item.get("confidence", 0)) >= 0.65]
+    spaces = [item for item in list(spec.get("spaces") or [])
+              if _bounded_confidence(item.get("confidence", 0)) >= 0.65]
+    discrepancies = []
+    matched = 0
+    for item in walls:
+        if any(_wall_matches(item, wall, tolerance) for wall in model.walls):
+            matched += 1
+        else:
+            discrepancies.append({"kind": "missing_specified_wall",
+                                  "description": f"No pixel-supported reconstructed wall matches {item.get('start')} to {item.get('end')}.",
+                                  "target": item})
+    for item in spaces:
+        center = item.get("center")
+        if any(_room_contains(room, center, tolerance) for room in model.rooms):
+            matched += 1
+        else:
+            discrepancies.append({"kind": "missing_specified_space",
+                                  "description": f"No reconstructed space contains vision target {item.get('label')!r} at {center}.",
+                                  "target": item})
+    total = len(walls) + len(spaces)
+    ratio = matched / total if total else 0.0
+    status = "approved" if total and ratio >= 0.70 else ("needs_correction" if total else "insufficient")
+    confidence = _bounded_confidence(spec.get("confidence", 0)) * (0.5 + 0.5 * ratio)
+    return {"review": {"status": status, "confidence": confidence,
+                       "summary": f"Matched {matched}/{total} high-confidence vision targets to pixel-derived topology.",
+                       "discrepancies": discrepancies[:50]}}
+
+
+def _wall_matches(item: dict, wall: Wall, tolerance: float) -> bool:
+    try:
+        start, end = item["start"], item["end"]
+        sx, sy, ex, ey = map(float, (start[0], start[1], end[0], end[1]))
+        wx1, wy1 = map(float, wall.start)
+        wx2, wy2 = map(float, wall.end)
+    except (KeyError, TypeError, ValueError, IndexError):
+        return False
+    horizontal = abs(ex - sx) >= abs(ey - sy)
+    wall_horizontal = abs(wx2 - wx1) >= abs(wy2 - wy1)
+    if horizontal != wall_horizontal:
+        return False
+    if horizontal:
+        return abs((sy + ey - wy1 - wy2) / 2) <= tolerance and _overlap(sx, ex, wx1, wx2) >= 0.45
+    return abs((sx + ex - wx1 - wx2) / 2) <= tolerance and _overlap(sy, ey, wy1, wy2) >= 0.45
+
+
+def _overlap(a1: float, a2: float, b1: float, b2: float) -> float:
+    alo, ahi = sorted((a1, a2))
+    blo, bhi = sorted((b1, b2))
+    return max(0.0, min(ahi, bhi) - max(alo, blo)) / max(ahi - alo, 1.0)
+
+
+def _room_contains(room, center, tolerance: float) -> bool:
+    if not isinstance(center, (list, tuple)) or len(center) != 2 or not room.boundary:
+        return False
+    try:
+        x, y = map(float, center)
+        xs = [float(point[0]) for point in room.boundary]
+        ys = [float(point[1]) for point in room.boundary]
+    except (TypeError, ValueError, IndexError):
+        return False
+    return min(xs) - tolerance <= x <= max(xs) + tolerance and min(ys) - tolerance <= y <= max(ys) + tolerance
+
+def _qwen_json(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
         ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
         if not ok:
             raise RuntimeError("could not encode plan image")
@@ -155,7 +227,7 @@ class QwenTopologyGuide:
                     "matching the requested keys, with no markdown, comments, or trailing text."
                 )
             body = json.dumps({
-                "model": self.model,
+                "model": model,
                 "messages": [{"role": "user", "content": [
                     {"type": "text", "text": attempt_prompt},
                     {"type": "image_url", "image_url": {"url": image_url}},
@@ -172,7 +244,7 @@ class QwenTopologyGuide:
                 "https://api.groq.com/openai/v1/chat/completions",
                 data=body,
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                     "User-Agent": "FireShield-Floorplan/1.0",
