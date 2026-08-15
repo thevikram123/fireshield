@@ -25,6 +25,7 @@ import '../data/fs_models.dart';
 import '../fs_app_state.dart';
 import '../services/fs_clipseg_service.dart';
 import '../services/fs_groq_service.dart';
+import '../services/fs_persistence_service.dart';
 import '../theme/fs_tokens.dart';
 import '../widgets/fs_ui.dart';
 
@@ -45,10 +46,23 @@ const _kPhases = [
 const _kSystemEvidence = {
   'Fire Extinguishers': ['extinguisher'],
   'Automatic Sprinklers': ['sprinkler'],
-  'Detection & Alarm': ['detector', 'manual_call_point', 'alarm_panel'],
-  'Hydrant / Wet Riser': ['hydrant_hose_reel'],
+  'Detection & Alarm': [
+    'smoke_detector',
+    'heat_detector',
+    'manual_call_point',
+    'alarm_sounder_strobe',
+    'alarm_panel',
+  ],
+  'Hydrant / Wet Riser': [
+    'hydrant_hose_reel',
+    'landing_valve',
+    'fire_department_connection',
+    'fire_pump',
+  ],
   'Exit Signage & Emergency Lighting': ['exit_sign', 'emergency_light'],
-  'Fire Doors': ['fire_door'],
+  'Fire Doors': ['fire_door', 'door_closer'],
+  'Special Suppression': ['kitchen_suppression'],
+  'Evacuation Information': ['evacuation_map'],
 };
 
 class FsAiAuditEngineScreen extends StatefulWidget {
@@ -61,12 +75,18 @@ class FsAiAuditEngineScreen extends StatefulWidget {
 class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
   final FsGroqService _svc = FsGroqService();
   final FsClipsegService _clip = FsClipsegService();
+  final FsPersistenceService _persistence = FsPersistenceService();
 
   int _phase = 0;
   BuildingType? _building;
   Map<String, dynamic> _profile = const {};
   List<DetectedEquipment> _detected = const [];
+  Map<String, dynamic> _evidenceContext = const {};
+  List<String> _evidenceDataUrls = const [];
   FsAuditRun? _run;
+  String? _storageStatus;
+  String? _storageError;
+  bool _saving = false;
 
   @override
   void initState() {
@@ -103,10 +123,92 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
     });
   }
 
+  Future<void> _acceptSiteRun(_SiteRunResult result) async {
+    setState(() {
+      _saving = true;
+      _storageStatus = null;
+      _storageError = null;
+    });
+    if (!_persistence.isSignedIn) {
+      setState(() {
+        _run = result.run;
+        _phase = 6;
+        _saving = false;
+        _storageStatus =
+            'Demo analysis completed. Sign in with an organisation '
+            'account to store the photos, findings and audit history.';
+      });
+      return;
+    }
+    try {
+      final organisationId = await _persistence.currentOrganisationId();
+      final assessmentId = await _persistence.createAssessment(
+        organisationId: organisationId,
+        kind: 'site',
+        title: '${_building?.label ?? 'Site assessment'} · '
+            '${_evidenceContext['level'] ?? ''} · ${_evidenceContext['zone'] ?? ''}',
+        buildingProfile: {..._profile, 'evidenceContext': _evidenceContext},
+      );
+      final artifactIds = <String>[];
+      for (var i = 0; i < _evidenceDataUrls.length; i++) {
+        final dataUrl = _evidenceDataUrls[i];
+        final comma = dataUrl.indexOf(',');
+        if (comma < 0) continue;
+        final mime =
+            RegExp(r'^data:([^;]+);base64,').firstMatch(dataUrl)?.group(1) ??
+                'image/jpeg';
+        final extension = mime == 'image/png'
+            ? 'png'
+            : mime == 'image/webp'
+                ? 'webp'
+                : 'jpg';
+        artifactIds.add(await _persistence.uploadArtifact(
+          organisationId: organisationId,
+          assessmentId: assessmentId,
+          filename: 'site_${i + 1}.$extension',
+          kind: 'site_image',
+          mimeType: mime,
+          bytes: base64Decode(dataUrl.substring(comma + 1)),
+        ));
+      }
+      final modelRunId = await _persistence.beginModelRun(
+        assessmentId: assessmentId,
+        provider: 'Hugging Face + Groq',
+        model: 'CLIPSeg + qwen/qwen3.6-27b + openai/gpt-oss-120b',
+        purpose: 'site_visual_nbcs_assessment',
+        inputArtifactIds: artifactIds,
+      );
+      await _persistence.saveSiteResult(
+        assessmentId: assessmentId,
+        modelRunId: modelRunId,
+        result: result.run,
+        latencyMs: result.latencyMs,
+      );
+      if (!mounted) return;
+      setState(() {
+        _run = result.run;
+        _phase = 6;
+        _storageStatus =
+            'Saved evidence photos, detections, findings and citations to audit history.';
+      });
+    } on FsPersistenceException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _run = result.run;
+        _phase = 6;
+        _storageError =
+            'Analysis succeeded, but database save failed: ${error.message}';
+      });
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) => Column(
         children: [
           _buildPhaseBar(),
+          if (_saving) const LinearProgressIndicator(minHeight: 3),
           Expanded(
             child: switch (_phase) {
               0 => _Phase1BuildingIntel(
@@ -126,13 +228,16 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
               3 => _Phase4PhotoAi(
                   svc: _svc,
                   clip: _clip,
-                  onNext: (detected) => setState(() {
-                    _detected = detected;
+                  onNext: (result) => setState(() {
+                    _detected = result.detected;
+                    _evidenceContext = result.context;
+                    _evidenceDataUrls = result.dataUrls;
                     _phase = 4;
                   }),
                 ),
               4 => _Phase5GapAnalysis(
                   detected: _detected,
+                  evidenceContext: _evidenceContext,
                   onNext: () => setState(() => _phase = 5),
                 ),
               5 => _Phase6Findings(
@@ -140,13 +245,13 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
                   profile: _profile,
                   building: _building,
                   detected: _detected,
-                  onNext: (run) => setState(() {
-                    _run = run;
-                    _phase = 6;
-                  }),
+                  evidenceContext: _evidenceContext,
+                  onNext: _acceptSiteRun,
                 ),
               6 => _Phase7Compliance(
                   run: _run,
+                  storageStatus: _storageStatus,
+                  storageError: _storageError,
                   onNext: () => setState(() => _phase = 7),
                 ),
               _ => _Phase8NocReadiness(
@@ -155,7 +260,11 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
                     _phase = 0;
                     _building = FsAppState.instance.classifiedBuilding;
                     _detected = const [];
+                    _evidenceContext = const {};
+                    _evidenceDataUrls = const [];
                     _run = null;
+                    _storageStatus = null;
+                    _storageError = null;
                   }),
                 ),
             },
@@ -216,7 +325,8 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
 
 class _Phase1BuildingIntel extends StatefulWidget {
   final BuildingType? initial;
-  final void Function(BuildingType type, double? heightM, double? areaM2) onNext;
+  final void Function(BuildingType type, double? heightM, double? areaM2)
+      onNext;
   const _Phase1BuildingIntel({required this.initial, required this.onNext});
 
   @override
@@ -378,7 +488,8 @@ class _Phase2RegulationsState extends State<_Phase2Regulations> {
     final seed = '${p['occupancy'] ?? ''} ${widget.building?.label ?? ''} '
         'sprinkler hydrant detector extinguisher exit refuge';
     try {
-      final clauses = await widget.svc.nbcQuery(q, seedTerms: seed, k: 10, hops: 1);
+      final clauses =
+          await widget.svc.nbcQuery(q, seedTerms: seed, k: 10, hops: 1);
       if (mounted) setState(() => _clauses = clauses);
     } catch (e) {
       if (mounted) {
@@ -399,8 +510,8 @@ class _Phase2RegulationsState extends State<_Phase2Regulations> {
     final checkpoints = t == null
         ? allCheckpoints
         : OccupancyTaxonomy.checkpointsFor(t, allCheckpoints);
-    final standards =
-        checkpoints.map((c) => c.standardLabel).toSet().toList()..sort();
+    final standards = checkpoints.map((c) => c.standardLabel).toSet().toList()
+      ..sort();
 
     return Column(
       children: [
@@ -585,10 +696,17 @@ class _Phase3Checklist extends StatelessWidget {
 
 // ─── Phase 4 — Photo AI (CLIPSeg + Qwen vision) ────────────────────────────
 
+class _PhotoAiResult {
+  final List<DetectedEquipment> detected;
+  final Map<String, dynamic> context;
+  final List<String> dataUrls;
+  const _PhotoAiResult(this.detected, this.context, this.dataUrls);
+}
+
 class _Phase4PhotoAi extends StatefulWidget {
   final FsGroqService svc;
   final FsClipsegService clip;
-  final ValueChanged<List<DetectedEquipment>> onNext;
+  final ValueChanged<_PhotoAiResult> onNext;
   const _Phase4PhotoAi({
     required this.svc,
     required this.clip,
@@ -601,13 +719,41 @@ class _Phase4PhotoAi extends StatefulWidget {
 
 class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
   final ImagePicker _picker = ImagePicker();
+  final TextEditingController _level = TextEditingController();
+  final TextEditingController _zone = TextEditingController();
+  final TextEditingController _notes = TextEditingController();
   final List<String> _dataUrls = [];
+  String _purpose = 'general_area';
+  String _coverage = 'spot_check';
   bool _busy = false;
+  bool _analysed = false;
   String _status = '';
   String? _error;
   List<DetectedEquipment> _detected = const [];
 
+  Map<String, dynamic> get _context => {
+        'level': _level.text.trim(),
+        'zone': _zone.text.trim(),
+        'purpose': _purpose,
+        'coverage': _coverage,
+        'notes': _notes.text.trim(),
+        'imageCount': _dataUrls.length,
+      };
+
+  @override
+  void dispose() {
+    _level.dispose();
+    _zone.dispose();
+    _notes.dispose();
+    super.dispose();
+  }
+
   Future<void> _pick(ImageSource source) async {
+    if (_level.text.trim().isEmpty || _zone.text.trim().isEmpty) {
+      setState(() => _error =
+          'Complete the floor/level and exact zone before adding photos.');
+      return;
+    }
     try {
       final List<XFile> files;
       if (source == ImageSource.camera) {
@@ -616,12 +762,22 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
       } else {
         files = await _picker.pickMultiImage(imageQuality: 70);
       }
-      for (final f in files.take(5 - _dataUrls.length)) {
+      final remaining = 5 - _dataUrls.length;
+      if (files.length > remaining) {
+        setState(() => _error =
+            'This evidence batch has room for $remaining more photo(s). '
+                'Create a separate batch for another floor or zone.');
+        return;
+      }
+      for (final f in files) {
         final bytes = await f.readAsBytes();
         final mime = f.mimeType ?? 'image/jpeg';
         _dataUrls.add('data:$mime;base64,${base64Encode(bytes)}');
       }
-      setState(() {});
+      setState(() {
+        _error = null;
+        _analysed = false;
+      });
     } catch (e) {
       setState(() => _error = 'Could not read image: $e');
     }
@@ -629,10 +785,16 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
 
   Future<void> _analyse() async {
     if (_dataUrls.isEmpty) return;
+    if (_level.text.trim().isEmpty || _zone.text.trim().isEmpty) {
+      setState(() =>
+          _error = 'Enter the floor/level and exact zone before analysis.');
+      return;
+    }
     setState(() {
       _busy = true;
       _error = null;
       _detected = const [];
+      _analysed = false;
     });
 
     final merged = <String, DetectedEquipment>{};
@@ -664,14 +826,18 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
       // 2) Qwen vision via the Worker (baseline; reads type + condition).
       if (widget.svc.isConfigured) {
         setState(() => _status = 'Reading equipment detail (vision model)…');
-        for (final d in await widget.svc.visionDetect(_dataUrls)) {
+        for (final d in await widget.svc
+            .visionDetect(_dataUrls, evidenceContext: _context)) {
           add(d);
         }
       } else if (merged.isEmpty) {
         throw const FsServiceException(
             'Vision service not configured — set FIRESHIELD_WORKER_URL.');
       }
-      setState(() => _detected = merged.values.toList());
+      setState(() {
+        _detected = merged.values.toList();
+        _analysed = true;
+      });
     } catch (e) {
       setState(() => _error = e is FsServiceException ? e.message : '$e');
     } finally {
@@ -685,7 +851,7 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
   @override
   Widget build(BuildContext context) {
     final canAnalyse = _dataUrls.isNotEmpty && !_busy;
-    final hasResult = _detected.isNotEmpty;
+    final hasResult = _analysed;
     return Column(
       children: [
         Expanded(
@@ -700,12 +866,82 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
                 style: FsText.small,
               ),
               const SizedBox(height: 12),
+              TextField(
+                controller: _level,
+                enabled: !_busy,
+                decoration: const InputDecoration(
+                  labelText: 'Floor / level *',
+                  hintText: 'Example: Basement B1 or Level 3',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _zone,
+                enabled: !_busy,
+                decoration: const InputDecoration(
+                  labelText: 'Exact zone / location *',
+                  hintText: 'Example: east corridor outside Stair 2',
+                ),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                initialValue: _purpose,
+                decoration: const InputDecoration(labelText: 'Photo purpose'),
+                items: const [
+                  DropdownMenuItem(
+                      value: 'general_area',
+                      child: Text('General area survey')),
+                  DropdownMenuItem(
+                      value: 'equipment_closeup',
+                      child: Text('Equipment close-up')),
+                  DropdownMenuItem(
+                      value: 'egress_route',
+                      child: Text('Exit / egress route')),
+                  DropdownMenuItem(
+                      value: 'plant_room', child: Text('Pump / plant room')),
+                  DropdownMenuItem(
+                      value: 'kitchen', child: Text('Kitchen suppression')),
+                ],
+                onChanged: _busy
+                    ? null
+                    : (v) => setState(() => _purpose = v ?? _purpose),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                initialValue: _coverage,
+                decoration:
+                    const InputDecoration(labelText: 'Evidence coverage'),
+                items: const [
+                  DropdownMenuItem(
+                      value: 'spot_check',
+                      child: Text('Spot check — absence proves nothing')),
+                  DropdownMenuItem(
+                      value: 'complete_area',
+                      child: Text('Complete coverage of this zone')),
+                ],
+                onChanged: _busy
+                    ? null
+                    : (v) => setState(() => _coverage = v ?? _coverage),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _notes,
+                enabled: !_busy,
+                maxLines: 2,
+                decoration: const InputDecoration(
+                  labelText: 'Auditor notes (optional)',
+                  hintText:
+                      'Access restrictions or context for this evidence batch',
+                ),
+              ),
+              const SizedBox(height: 12),
               Row(
                 children: [
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed:
-                          _dataUrls.length >= 5 ? null : () => _pick(ImageSource.camera),
+                      onPressed: _dataUrls.length >= 5
+                          ? null
+                          : () => _pick(ImageSource.camera),
                       icon: const Icon(Icons.camera_alt, size: 18),
                       label: const Text('Camera'),
                     ),
@@ -713,8 +949,9 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed:
-                          _dataUrls.length >= 5 ? null : () => _pick(ImageSource.gallery),
+                      onPressed: _dataUrls.length >= 5
+                          ? null
+                          : () => _pick(ImageSource.gallery),
                       icon: const Icon(Icons.photo_library, size: 18),
                       label: const Text('Gallery'),
                     ),
@@ -727,8 +964,7 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
                   spacing: 8,
                   runSpacing: 8,
                   children: [
-                    for (var i = 0; i < _dataUrls.length; i++)
-                      _thumb(i),
+                    for (var i = 0; i < _dataUrls.length; i++) _thumb(i),
                   ],
                 ),
               ],
@@ -797,6 +1033,13 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
                         ),
                       ),
                     )),
+                if (_detected.isEmpty)
+                  Text(
+                    'No supported fire-safety equipment was detected in this '
+                    'evidence batch. Continue to compliance review; a spot check '
+                    'does not prove that equipment is absent.',
+                    style: FsText.small,
+                  ),
               ],
             ],
           ),
@@ -804,7 +1047,11 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
         if (!hasResult)
           _nextBar(context, canAnalyse, _analyse, label: 'Run detection')
         else
-          _nextBar(context, true, () => widget.onNext(_detected)),
+          _nextBar(
+              context,
+              true,
+              () => widget.onNext(_PhotoAiResult(
+                  _detected, _context, List.unmodifiable(_dataUrls)))),
       ],
     );
   }
@@ -831,7 +1078,10 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
             right: -6,
             child: IconButton(
               iconSize: 16,
-              onPressed: () => setState(() => _dataUrls.removeAt(i)),
+              onPressed: () => setState(() {
+                _dataUrls.removeAt(i);
+                _analysed = false;
+              }),
               icon: const Icon(Icons.cancel, color: FsColors.danger),
             ),
           ),
@@ -843,8 +1093,13 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
 
 class _Phase5GapAnalysis extends StatelessWidget {
   final List<DetectedEquipment> detected;
+  final Map<String, dynamic> evidenceContext;
   final VoidCallback onNext;
-  const _Phase5GapAnalysis({required this.detected, required this.onNext});
+  const _Phase5GapAnalysis({
+    required this.detected,
+    required this.evidenceContext,
+    required this.onNext,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -860,6 +1115,12 @@ class _Phase5GapAnalysis extends StatelessWidget {
                 'reasoning model will assess against NBCS 2026. A system with '
                 'no evidence is flagged for the model to verify as a gap.',
                 style: FsText.small,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${evidenceContext['level'] ?? ''} · ${evidenceContext['zone'] ?? ''} · '
+                '${evidenceContext['coverage'] == 'complete_area' ? 'complete zone coverage' : 'spot check'}',
+                style: FsText.tiny,
               ),
               const SizedBox(height: 12),
               ..._kSystemEvidence.entries.map((e) {
@@ -908,17 +1169,25 @@ class _Phase5GapAnalysis extends StatelessWidget {
 
 // ─── Phase 6 — Findings (gpt-oss reasoning over the NBC 2026 graph) ─────────
 
+class _SiteRunResult {
+  final FsAuditRun run;
+  final int latencyMs;
+  const _SiteRunResult(this.run, this.latencyMs);
+}
+
 class _Phase6Findings extends StatefulWidget {
   final FsGroqService svc;
   final Map<String, dynamic> profile;
   final BuildingType? building;
   final List<DetectedEquipment> detected;
-  final ValueChanged<FsAuditRun> onNext;
+  final Map<String, dynamic> evidenceContext;
+  final ValueChanged<_SiteRunResult> onNext;
   const _Phase6Findings({
     required this.svc,
     required this.profile,
     required this.building,
     required this.detected,
+    required this.evidenceContext,
     required this.onNext,
   });
 
@@ -930,6 +1199,7 @@ class _Phase6FindingsState extends State<_Phase6Findings> {
   bool _busy = false;
   String? _error;
   FsAuditRun? _run;
+  int? _latencyMs;
 
   Future<void> _run0() async {
     setState(() {
@@ -937,12 +1207,17 @@ class _Phase6FindingsState extends State<_Phase6Findings> {
       _error = null;
     });
     try {
+      final started = DateTime.now();
       final run = await widget.svc.reasonCompliance(
         occupancyGroup: widget.profile['occupancyGroup'] as String? ?? '',
         buildingProfile: widget.profile,
         detected: widget.detected,
+        evidenceContext: widget.evidenceContext,
       );
-      setState(() => _run = run);
+      setState(() {
+        _run = run;
+        _latencyMs = DateTime.now().difference(started).inMilliseconds;
+      });
     } catch (e) {
       setState(() => _error = e is FsServiceException ? e.message : '$e');
     } finally {
@@ -954,7 +1229,8 @@ class _Phase6FindingsState extends State<_Phase6Findings> {
   Widget build(BuildContext context) {
     final run = _run;
     final crit = run?.findings
-            .where((f) => f.severity == 'critical' || f.status == 'critical_gap')
+            .where(
+                (f) => f.severity == 'critical' || f.status == 'critical_gap')
             .length ??
         0;
     final major = run?.findings.where((f) => f.severity == 'major').length ?? 0;
@@ -1041,7 +1317,11 @@ class _Phase6FindingsState extends State<_Phase6Findings> {
             ],
           ),
         ),
-        _nextBar(context, run != null, () => widget.onNext(run!)),
+        _nextBar(
+          context,
+          run != null && _latencyMs != null,
+          () => widget.onNext(_SiteRunResult(run!, _latencyMs!)),
+        ),
       ],
     );
   }
@@ -1068,12 +1348,10 @@ class _Phase6FindingsState extends State<_Phase6Findings> {
                       BoxDecoration(color: color, shape: BoxShape.circle),
                 ),
                 const SizedBox(width: 8),
-                Expanded(
-                    child: Text(f.system,
-                        style: FsText.cardTitle)),
+                Expanded(child: Text(f.system, style: FsText.cardTitle)),
                 Text(f.status.replaceAll('_', ' '),
-                    style: FsText.tiny.copyWith(
-                        color: color, fontWeight: FontWeight.w700)),
+                    style: FsText.tiny
+                        .copyWith(color: color, fontWeight: FontWeight.w700)),
               ],
             ),
             if (f.rationale.isNotEmpty) ...[
@@ -1106,8 +1384,15 @@ class _Phase6FindingsState extends State<_Phase6Findings> {
 
 class _Phase7Compliance extends StatelessWidget {
   final FsAuditRun? run;
+  final String? storageStatus;
+  final String? storageError;
   final VoidCallback onNext;
-  const _Phase7Compliance({required this.run, required this.onNext});
+  const _Phase7Compliance({
+    required this.run,
+    required this.storageStatus,
+    required this.storageError,
+    required this.onNext,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1119,6 +1404,19 @@ class _Phase7Compliance extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                if (storageStatus != null)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
+                    child: Text(storageStatus!,
+                        textAlign: TextAlign.center, style: FsText.small),
+                  ),
+                if (storageError != null)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
+                    child: Text(storageError!,
+                        textAlign: TextAlign.center,
+                        style: FsText.small.copyWith(color: FsColors.danger)),
+                  ),
                 ScoreRing(score: score, size: 120),
                 const SizedBox(height: 16),
                 const Text('Compliance score', style: FsText.title),
@@ -1301,8 +1599,8 @@ Widget _nextBar(
               borderRadius: BorderRadius.circular(FsRadius.xl),
             ),
           ),
-          child: Text(label,
-              style: const TextStyle(fontWeight: FontWeight.w800)),
+          child:
+              Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
         ),
       ),
     );

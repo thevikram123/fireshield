@@ -7,6 +7,13 @@ so `GROQ_API_KEY` never reaches the browser. The reasoning route queries the
 Follow `../../../../Cloudflare worker and groq skill.md` for the security rules.
 **Run `wrangler whoami` before every mutation and stop if it shows the wrong account.**
 
+The Flutter web app remains on GitHub Pages. Floor-plan requests enter through
+this Worker and are forwarded to the authenticated Python service declared in
+the repository-root `render.yaml`. Configure the same random
+`FLOORPLAN_SERVICE_TOKEN` in Render and as a Worker secret; it must never reach
+the browser. The Worker supplies the existing Groq key only for the duration of
+the processor's Qwen review request.
+
 ## Routes
 | Method | Path | Purpose |
 |---|---|---|
@@ -33,23 +40,22 @@ npm.cmd exec wrangler -- whoami     # confirm the intended account
    npm.cmd exec wrangler -- secrets-store store list --remote
    npm.cmd exec wrangler -- secrets-store secret list <STORE_ID> --remote
    ```
-2. **R2 bucket** for the NBC index:
-   ```powershell
-   npm.cmd exec wrangler -- r2 bucket create fireshield-nbc-index
-   ```
+2. **Workers KV** stores the NBC index. The existing `NBC_KV` namespace is
+   declared in `wrangler.jsonc`.
 3. **Build + upload the index** (regenerate whenever the graph changes):
    ```powershell
    npm.cmd run index:build
    npm.cmd run index:upload
    ```
-4. Set `<OWNER>` in `ALLOWED_ORIGINS` (your GitHub Pages origin), and confirm the
-   rate-limit `namespace_id` (`53020`) is unused on the account.
+4. Confirm `ALLOWED_ORIGINS` contains only the production Pages origin and local
+   development origins. Rate-limit namespace IDs `53020` and `53021` are reserved
+   for the reasoning/chat and vision model budgets respectively.
 
 ## Deploy + verify
 
 ```powershell
 npm.cmd exec wrangler -- whoami
-npm.cmd exec wrangler -- deploy --dry-run    # inspect bindings: GROQ_API_KEY, NBC_BUCKET, models
+npm.cmd exec wrangler -- deploy --dry-run    # inspect GROQ_API_KEY, NBC_KV, limiters, models
 npm.cmd exec wrangler -- deploy
 ```
 

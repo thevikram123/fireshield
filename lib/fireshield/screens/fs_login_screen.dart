@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import '../data/fs_mock_data.dart';
 import '../data/fs_models.dart';
 import '../fs_app_state.dart';
+import '../services/fs_persistence_service.dart';
 import '../theme/fs_tokens.dart';
 
 /// Port of pwa_app/src/screens/LoginScreen.jsx
@@ -20,18 +21,24 @@ class FsLoginScreen extends StatefulWidget {
 class _FsLoginScreenState extends State<FsLoginScreen> {
   final _emailCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
+  final _nameCtrl = TextEditingController();
+  final _orgCtrl = TextEditingController();
 
   bool _demoMode = true;
   bool _showPass = false;
-  bool _remember = false;
+  bool _registerMode = false;
   bool _loading = false;
   int? _loadingId;
   String _error = '';
+  String _info = '';
+  final _persistence = FsPersistenceService();
 
   @override
   void dispose() {
     _emailCtrl.dispose();
     _passCtrl.dispose();
+    _nameCtrl.dispose();
+    _orgCtrl.dispose();
     super.dispose();
   }
 
@@ -73,23 +80,66 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
     }
     setState(() {
       _error = '';
+      _info = '';
       _loading = true;
     });
 
-    final user = await FsRepository.instance.signIn(
-      email: _emailCtrl.text,
-      password: _passCtrl.text,
-    );
-    if (!mounted) return;
+    try {
+      await _persistence.signInWithPassword(
+        _emailCtrl.text.trim(),
+        _passCtrl.text,
+      );
+      final user = await _persistence.currentAppUser();
+      if (!mounted) return;
+      FsAppState.instance.login(user);
+      context.go('/${user.role.key}');
+    } on FsPersistenceException catch (error) {
+      if (!mounted) return;
+      setState(() => _error = error.message);
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
 
-    setState(() => _loading = false);
-
-    if (user == null) {
-      _showAccountNotFound();
+  Future<void> _handleRegister() async {
+    if (_nameCtrl.text.trim().isEmpty ||
+        _orgCtrl.text.trim().length < 2 ||
+        _emailCtrl.text.trim().isEmpty ||
+        _passCtrl.text.length < 8) {
+      setState(() => _error =
+          'Enter your name, organisation, email and a password of at least 8 characters.');
       return;
     }
-    FsAppState.instance.login(user);
-    context.go('/${user.role.key}');
+    setState(() {
+      _error = '';
+      _info = '';
+      _loading = true;
+    });
+    try {
+      final signedIn = await _persistence.signUpOrganisationAdmin(
+        email: _emailCtrl.text.trim(),
+        password: _passCtrl.text,
+        displayName: _nameCtrl.text.trim(),
+        organisationName: _orgCtrl.text.trim(),
+      );
+      if (!mounted) return;
+      if (!signedIn) {
+        setState(() {
+          _registerMode = false;
+          _info = 'Check your email to confirm the account, then sign in. '
+              'Your organisation will be created on first sign-in.';
+        });
+        return;
+      }
+      final user = await _persistence.currentAppUser();
+      if (!mounted) return;
+      FsAppState.instance.login(user);
+      context.go('/${user.role.key}');
+    } on FsPersistenceException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
   @override
@@ -259,41 +309,18 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
           const SizedBox(height: 12),
           ...demoUsers.map(_buildRoleCard),
           const SizedBox(height: 8),
-          SizedBox(
-            width: double.infinity,
-            height: 48,
-            child: OutlinedButton(
-              onPressed: () {},
-              style: OutlinedButton.styleFrom(
-                backgroundColor: FsColors.roleManager.withValues(alpha: 0.1),
-                side: BorderSide(
-                  color: const Color(0xFF3B82F6).withValues(alpha: 0.4),
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(FsRadius.xl2),
-                ),
-              ),
-              child: const Text(
-                '☁️  Continue with Azure Active Directory',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: Color(0xFF93C5FD),
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
           Text(
-            'Single Sign-On · MFA Supported · ISO 27001',
-            style: FsText.tiny.copyWith(color: FsColors.gray600),
+            'Demo roles run live AI but do not write shared history. Use an '
+            'organisation account for persistent uploads and assessments.',
+            textAlign: TextAlign.center,
+            style: FsText.tiny.copyWith(color: FsColors.gray500),
           ),
         ],
       );
 
   Widget _buildRoleCard(FsUser u) {
-    final (icon, color, desc) = _roleConfig[u.role] ??
-        ('👤', FsColors.muted, '');
+    final (icon, color, desc) =
+        _roleConfig[u.role] ?? ('👤', FsColors.muted, '');
     final isLoading = _loadingId == u.id;
 
     return Padding(
@@ -345,8 +372,8 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
                               padding: const EdgeInsets.symmetric(
                                   horizontal: 6, vertical: 2),
                               decoration: BoxDecoration(
-                                color: FsColors.heroYellow
-                                    .withValues(alpha: 0.1),
+                                color:
+                                    FsColors.heroYellow.withValues(alpha: 0.1),
                                 borderRadius: BorderRadius.circular(4),
                               ),
                               child: const Text(
@@ -455,11 +482,46 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
   Widget _buildEmailMode() => Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          Row(
+            children: [
+              Expanded(
+                child: TextButton(
+                  onPressed: _loading
+                      ? null
+                      : () => setState(() => _registerMode = false),
+                  child: Text(_registerMode ? 'Sign in' : '• Sign in'),
+                ),
+              ),
+              Expanded(
+                child: TextButton(
+                  onPressed: _loading
+                      ? null
+                      : () => setState(() => _registerMode = true),
+                  child: Text(
+                      _registerMode ? '• Create account' : 'Create account'),
+                ),
+              ),
+            ],
+          ),
+          if (_info.isNotEmpty) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF064E3B).withValues(alpha: 0.35),
+                borderRadius: BorderRadius.circular(FsRadius.xl),
+              ),
+              child: Text(
+                _info,
+                style: const TextStyle(fontSize: 12, color: Color(0xFF6EE7B7)),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           if (_error.isNotEmpty) ...[
             Container(
               width: double.infinity,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
                 color: const Color(0xFF7F1D1D).withValues(alpha: 0.3),
                 borderRadius: BorderRadius.circular(FsRadius.xl),
@@ -469,10 +531,17 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
               ),
               child: Text(
                 _error,
-                style: const TextStyle(
-                    fontSize: 12, color: Color(0xFFF87171)),
+                style: const TextStyle(fontSize: 12, color: Color(0xFFF87171)),
               ),
             ),
+            const SizedBox(height: 16),
+          ],
+          if (_registerMode) ...[
+            _fieldLabel('Full Name'),
+            _darkField(controller: _nameCtrl, hint: 'Your name'),
+            const SizedBox(height: 16),
+            _fieldLabel('Organisation'),
+            _darkField(controller: _orgCtrl, hint: 'Organisation name'),
             const SizedBox(height: 16),
           ],
           _fieldLabel('Email Address'),
@@ -501,47 +570,14 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
               ),
             ),
           ),
-          const SizedBox(height: 12),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              GestureDetector(
-                onTap: () => setState(() => _remember = !_remember),
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: Checkbox(
-                        value: _remember,
-                        onChanged: (v) =>
-                            setState(() => _remember = v ?? false),
-                        activeColor: FsColors.heroYellow,
-                        checkColor: FsColors.gray900,
-                        side: const BorderSide(color: FsColors.gray600),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text('Remember me',
-                        style: FsText.small.copyWith(color: FsColors.gray500)),
-                  ],
-                ),
-              ),
-              Text(
-                'Forgot password?',
-                style: FsText.small.copyWith(
-                  color: FsColors.heroYellow,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ],
-          ),
           const SizedBox(height: 16),
           SizedBox(
             width: double.infinity,
             height: 48,
             child: ElevatedButton(
-              onPressed: _loading ? null : _handleLogin,
+              onPressed: _loading
+                  ? null
+                  : (_registerMode ? _handleRegister : _handleLogin),
               style: ElevatedButton.styleFrom(
                 backgroundColor: FsColors.heroYellow,
                 foregroundColor: FsColors.gray900,
@@ -561,19 +597,19 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
                           height: 16,
                           child: CircularProgressIndicator(
                             strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(
-                                FsColors.gray900),
+                            valueColor:
+                                AlwaysStoppedAnimation<Color>(FsColors.gray900),
                           ),
                         ),
                         SizedBox(width: 8),
-                        Text('Signing in...',
+                        Text('Working...',
                             style: TextStyle(
                                 fontSize: 14, fontWeight: FontWeight.w700)),
                       ],
                     )
-                  : const Text(
-                      'Sign In',
-                      style: TextStyle(
+                  : Text(
+                      _registerMode ? 'Create Organisation Account' : 'Sign In',
+                      style: const TextStyle(
                           fontSize: 14, fontWeight: FontWeight.w700),
                     ),
             ),
@@ -707,8 +743,7 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
                       ),
                       Text(
                         'Smart Fire Solution Consultant · EY',
-                        style:
-                            FsText.tiny.copyWith(color: FsColors.gray400),
+                        style: FsText.tiny.copyWith(color: FsColors.gray400),
                       ),
                     ],
                   ),
@@ -889,8 +924,7 @@ class _FsLoginScreenState extends State<FsLoginScreen> {
                   ),
                   child: const Text(
                     'Close',
-                    style: TextStyle(
-                        fontSize: 14, fontWeight: FontWeight.w700),
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
                   ),
                 ),
               ),

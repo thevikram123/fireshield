@@ -13,6 +13,7 @@ import '../../data/nbc_bis_masterdata.dart';
 import '../data/fs_mock_data.dart';
 import '../data/fs_models.dart';
 import '../fs_app_state.dart';
+import '../services/fs_groq_service.dart';
 import '../theme/fs_tokens.dart';
 import '../widgets/fs_ui.dart';
 
@@ -406,52 +407,51 @@ class FsAiAssistant extends StatefulWidget {
 
 class _FsAiAssistantState extends State<FsAiAssistant> {
   final _ctrl = TextEditingController();
+  final _service = FsGroqService();
+  bool _sending = false;
   final List<(bool, String)> _messages = [
     (
       false,
-      'Ask me about NBC 2016 Part 4, BIS standards, or any checkpoint in the audit master.'
+      'Ask me about NBCS 2026 Part F, BIS standards, or any checkpoint in the audit master.'
     ),
-  ];
-
-  static const _suggestions = [
-    'What is the minimum exit width?',
-    'When is a fire lift required?',
-    'Extinguisher spacing for Class A',
   ];
 
   @override
   void dispose() {
     _ctrl.dispose();
+    _service.dispose();
     super.dispose();
   }
 
-  void _send(String text) {
-    if (text.trim().isEmpty) return;
+  Future<void> _send(String text) async {
+    final question = text.trim();
+    if (question.isEmpty || _sending) return;
     setState(() {
-      _messages.add((true, text.trim()));
-      _messages.add((false, _lookup(text)));
+      _messages.add((true, question));
       _ctrl.clear();
+      _sending = true;
     });
-  }
-
-  /// Local lookup over the checkpoint master. No model call — the PWA's
-  /// assistant is also canned, and this at least answers from real data.
-  String _lookup(String query) {
-    final q = query.toLowerCase();
-    final hits = allCheckpoints.where((c) {
-      final hay = '${c.title} ${c.description} ${c.subCategory}'.toLowerCase();
-      return q
-          .split(RegExp(r'\s+'))
-          .where((w) => w.length > 3)
-          .any(hay.contains);
-    }).take(3);
-
-    if (hits.isEmpty) {
-      return 'Nothing in the checkpoint master matches that. Try a term like "exit", "sprinkler", "hydrant" or "detector".';
+    try {
+      final history = _messages
+          .skip(1)
+          .map((m) => {
+                'role': m.$1 ? 'user' : 'assistant',
+                'content': m.$2,
+              })
+          .toList();
+      final answer = await _service.chat(history);
+      if (!mounted) return;
+      setState(() => _messages.add((false,
+          answer.isEmpty ? 'The AI service returned an empty response.' : answer)));
+    } on FsServiceException catch (error) {
+      if (!mounted) return;
+      setState(() => _messages.add((false,
+          error.status == 429
+              ? 'The AI request limit was reached. Please wait about a minute and try again.'
+              : 'AI assistant unavailable: ${error.message}')));
+    } finally {
+      if (mounted) setState(() => _sending = false);
     }
-    return hits
-        .map((c) => '${c.id} · ${c.standardLabel}\n${c.title}\n${c.description}')
-        .join('\n\n');
   }
 
   @override
@@ -491,34 +491,6 @@ class _FsAiAssistantState extends State<FsAiAssistant> {
               },
             ),
           ),
-          if (_messages.length == 1)
-            SizedBox(
-              height: 40,
-              child: ListView(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                children: _suggestions
-                    .map((s) => Padding(
-                          padding: const EdgeInsets.only(right: 8),
-                          child: GestureDetector(
-                            onTap: () => _send(s),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 12, vertical: 8),
-                              decoration: BoxDecoration(
-                                color: FsColors.infoLight,
-                                borderRadius:
-                                    BorderRadius.circular(FsRadius.full),
-                              ),
-                              child: Text(s,
-                                  style: FsText.tiny
-                                      .copyWith(color: FsColors.info)),
-                            ),
-                          ),
-                        ))
-                    .toList(),
-              ),
-            ),
           Container(
             padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
             decoration: const BoxDecoration(
@@ -548,17 +520,26 @@ class _FsAiAssistantState extends State<FsAiAssistant> {
                 ),
                 const SizedBox(width: 8),
                 GestureDetector(
-                  onTap: () => _send(_ctrl.text),
+                  onTap: _sending ? null : () => _send(_ctrl.text),
                   child: Container(
                     width: 42,
                     height: 42,
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: FsColors.primary,
+                      color: _sending ? FsColors.gray400 : FsColors.primary,
                       borderRadius: BorderRadius.circular(FsRadius.full),
                     ),
-                    child: const Icon(Icons.arrow_upward,
-                        color: Colors.white, size: 18),
+                    child: _sending
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.arrow_upward,
+                            color: Colors.white, size: 18),
                   ),
                 ),
               ],

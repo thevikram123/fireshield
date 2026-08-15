@@ -17,6 +17,33 @@ const GROQ_BASE = 'https://api.groq.com/openai/v1';
 const MAX_JSON_BYTES = 48_000;
 const MAX_VISION_BYTES = 22 * 1024 * 1024; // 5 images * ~4MB + JSON overhead
 const MAX_TOOL_HOPS = 4;
+const PLAN_GUIDANCE_QUERIES = [
+  'means of egress number of exits travel distance exit width occupant load',
+  'staircase minimum width number of stairways fire escape pressurization',
+  'fire compartment compartmentation fire door protected shaft',
+  'emergency lighting exit signage escape route floor plan',
+  'automatic detection sprinkler wet riser hydrant Table 7 occupancy height area',
+  'refuge area accessible means of egress high rise building',
+];
+const VISUAL_GUIDANCE_QUERIES = {
+  extinguisher: 'fire extinguisher requirement inspection installation Table 7',
+  sprinkler: 'automatic wet sprinkler requirement sprinkler heads inspection',
+  smoke_detector: 'automatic smoke detection alarm system point type smoke detector',
+  heat_detector: 'heat detector automatic fire detection alarm system',
+  manual_call_point: 'manual call point break glass fire alarm',
+  alarm_sounder_strobe: 'fire alarm notification visual alarm strobe voice evacuation',
+  alarm_panel: 'fire alarm panel annunciation fire command centre',
+  exit_sign: 'escape lighting exit signage means of egress',
+  emergency_light: 'emergency lighting escape route duration illumination',
+  fire_door: 'fire door fire rating self closing means of egress',
+  door_closer: 'fire door self closing device door closer',
+  hydrant_hose_reel: 'hose reel wet riser yard hydrant Table 7',
+  landing_valve: 'landing valve wet riser firefighting shaft',
+  kitchen_suppression: 'wet chemical kitchen suppression commercial cooking area',
+  fire_pump: 'fire pumps water supply firefighting installation',
+  fire_department_connection: 'fire brigade inlet connection dividing breeching',
+  evacuation_map: 'floor plan stairway marking sign evacuation information',
+};
 
 export default {
   async fetch(request, env) {
@@ -34,11 +61,25 @@ export default {
           service: 'fireshield groq gateway',
           groqBindingConfigured: Boolean(env.GROQ_API_KEY),
           nbcIndexConfigured: Boolean(env.NBC_BUCKET || env.NBC_KV),
+          rateLimitsConfigured: Boolean(env.REASON_RATE_LIMITER && env.VISION_RATE_LIMITER),
+          floorplanConfigured: Boolean(
+            env.FLOORPLAN_SERVICE_URL && env.FLOORPLAN_SERVICE_TOKEN && env.PLAN_RATE_LIMITER,
+          ),
           models: { vision: env.GROQ_VISION_MODEL, reason: env.GROQ_REASON_MODEL },
         }, 200, cors);
       }
 
       if (!isAllowedOrigin(origin, env)) return json({ error: 'origin not allowed' }, 403, cors);
+
+      if (url.pathname === '/plan/convert' && request.method === 'POST') {
+        const limited = await enforcePlanRateLimit(env, cors);
+        if (limited) return limited;
+        const modelLimited = await enforcePlanModelRateLimits(env, cors);
+        if (modelLimited) return modelLimited;
+        const groqKey = await readSecret(env.GROQ_API_KEY);
+        if (!groqKey) return json({ error: 'GROQ_API_KEY is not configured' }, 503, cors);
+        return convertFloorplan(request, env, cors, groqKey);
+      }
 
       const routes = {
         '/groq/chat': groqChat,
@@ -49,15 +90,11 @@ export default {
       const handler = routes[url.pathname];
       if (!handler || request.method !== 'POST') return json({ error: 'not found' }, 404, cors);
 
-      // Per-caller rate limit (best-effort; skips if binding absent).
-      const actor = request.headers.get('CF-Connecting-IP') || 'anonymous';
-      if (env.GROQ_RATE_LIMITER) {
-        const limited = await env.GROQ_RATE_LIMITER.limit({ key: `${url.pathname}:${actor}` });
-        if (!limited.success) return json({ error: 'rate limit exceeded' }, 429, cors);
-      }
-
       // /nbc/query needs no Groq key.
       if (url.pathname === '/nbc/query') return handler(request, env, cors);
+
+      const rateLimitResponse = await enforceGroqRateLimit(url.pathname, env, cors);
+      if (rateLimitResponse) return rateLimitResponse;
 
       const groqKey = await readSecret(env.GROQ_API_KEY);
       if (!groqKey) return json({ error: 'GROQ_API_KEY is not configured' }, 503, cors);
@@ -72,6 +109,130 @@ export default {
   },
 };
 
+async function convertFloorplan(request, env, cors, groqKey) {
+  if (tooLarge(request, 25 * 1024 * 1024)) {
+    return json({ error: 'floor plan exceeds the 25 MB limit' }, 413, cors);
+  }
+  const serviceUrl = String(env.FLOORPLAN_SERVICE_URL || '').replace(/\/$/, '');
+  const serviceToken = await readSecret(env.FLOORPLAN_SERVICE_TOKEN);
+  if (!serviceUrl || !serviceToken) {
+    return json({ error: 'floor plan processor is not configured' }, 503, cors);
+  }
+  let upstream;
+  try {
+    upstream = await fetch(`${serviceUrl}/convert`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': request.headers.get('Content-Type') || 'application/octet-stream',
+        'X-FireShield-Service-Token': serviceToken,
+        'X-FireShield-Groq-Key': groqKey,
+      },
+      body: request.body,
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: 'floor plan processor unavailable',
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    return json({ error: 'floor plan processor unavailable' }, 502, cors);
+  }
+  let converted;
+  try {
+    converted = await upstream.json();
+  } catch {
+    return json({ error: 'floor plan processor returned invalid JSON' }, 502, cors);
+  }
+  if (!upstream.ok) return json(converted, upstream.status, cors);
+
+  const compliance = await assessFloorplan(converted, env, groqKey);
+  if (compliance.error) {
+    return json({
+      error: compliance.error,
+      stage: 'nbcs_plan_assessment',
+      conversionCompleted: true,
+    }, compliance.status, { ...cors, ...compliance.headers });
+  }
+  return json({ ...converted, compliance: compliance.value }, 200, cors);
+}
+
+async function assessFloorplan(converted, env, apiKey) {
+  const guidance = await Promise.all(PLAN_GUIDANCE_QUERIES.map(async (question) => {
+    try {
+      const result = await queryNbc(env, question, { k: 5, hops: 1 });
+      return { question, results: result.results };
+    } catch {
+      return { question, error: 'NBCS guidance lookup failed' };
+    }
+  }));
+  const plan = compactPlanForReasoning(converted);
+  const data = await callGroq(apiKey, {
+    model: env.GROQ_REASON_MODEL,
+    messages: [
+      { role: 'system', content: PLAN_REASON_SYSTEM },
+      { role: 'user', content: JSON.stringify({ plan, nbcsGuidance: guidance }).slice(0, 30000) },
+    ],
+    temperature: 0.2,
+    max_completion_tokens: 2200,
+    include_reasoning: false,
+    response_format: { type: 'json_object' },
+  });
+  if (data.error) return data;
+  const value = safeJson(data.json?.choices?.[0]?.message?.content);
+  if (!value || !Array.isArray(value.findings)) {
+    return { error: 'GPT-OSS returned an invalid plan assessment', status: 502, headers: {} };
+  }
+  return { value };
+}
+
+function compactPlanForReasoning(converted) {
+  const topology = converted?.topology || {};
+  return {
+    buildingProfile: converted?.buildingProfile || {},
+    qwenReview: converted?.guidance || {},
+    metrics: converted?.metrics || {},
+    units: topology.units,
+    mmPerPx: topology.mm_per_px,
+    imageSize: topology.image_size,
+    exteriorBoundary: topology.exterior_boundary,
+    rooms: Array.isArray(topology.rooms) ? topology.rooms.slice(0, 100) : [],
+    doors: Array.isArray(topology.doors) ? topology.doors.slice(0, 150) : [],
+    windows: Array.isArray(topology.windows) ? topology.windows.slice(0, 150) : [],
+    objects: Array.isArray(topology.objects) ? topology.objects.slice(0, 150) : [],
+    roomGraph: topology.room_graph || {},
+  };
+}
+
+async function enforcePlanRateLimit(env, cors) {
+  if (!env.PLAN_RATE_LIMITER) return json({ error: 'plan rate limiter is not configured' }, 503, cors);
+  const result = await env.PLAN_RATE_LIMITER.limit({ key: 'floorplan-conversion' });
+  if (result.success) return null;
+  return json({ error: 'floor plan conversion rate limit exceeded', retryAfterSeconds: 60 }, 429, {
+    ...cors,
+    'Retry-After': '60',
+    'X-RateLimit-Policy': '5;w=60',
+  });
+}
+
+async function enforcePlanModelRateLimits(env, cors) {
+  const reservations = [
+    [env.VISION_RATE_LIMITER, 'qwen/qwen3.6-27b'],
+    [env.REASON_RATE_LIMITER, 'openai/gpt-oss-120b'],
+  ];
+  for (const [limiter, key] of reservations) {
+    if (!limiter) return json({ error: 'AI rate limiter is not configured' }, 503, cors);
+    const result = await limiter.limit({ key });
+    if (!result.success) {
+      return json({ error: 'AI request rate limit exceeded', retryAfterSeconds: 60 }, 429, {
+        ...cors,
+        'Retry-After': '60',
+        'X-RateLimit-Policy': '25;w=60',
+      });
+    }
+  }
+  return null;
+}
+
 // ── Groq: text chat ─────────────────────────────────────────────────────────
 async function groqChat(request, env, cors, apiKey) {
   if (tooLarge(request, MAX_JSON_BYTES)) return json({ error: 'request too large' }, 413, cors);
@@ -82,14 +243,34 @@ async function groqChat(request, env, cors, apiKey) {
     .map((m) => ({ role: m.role, content: String(m.content || '').slice(0, 6000) }));
   if (!messages.length) return json({ error: 'messages are required' }, 400, cors);
 
+  // Ground the assistant in the same page-anchored NBCS 2026 index used by the
+  // compliance engine. If lookup fails, the model is told not to invent rules.
+  const latestQuestion = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
+  let nbcContext = { results: [] };
+  try {
+    nbcContext = await queryNbc(env, latestQuestion, { k: 8, hops: 1 });
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: 'chat NBC context lookup failed',
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+
   const data = await callGroq(apiKey, {
     model: env.GROQ_REASON_MODEL,
-    messages,
+    messages: [
+      { role: 'system', content: CHAT_SYSTEM },
+      {
+        role: 'system',
+        content: `Relevant NBCS 2026 index results (cite page numbers when used):\n${JSON.stringify(nbcContext.results).slice(0, 8000)}`,
+      },
+      ...messages,
+    ],
     temperature: 0.4,
     max_completion_tokens: 1024,
     include_reasoning: false,
   });
-  if (data.error) return json({ error: data.error }, data.status, cors);
+  if (data.error) return json({ error: data.error }, data.status, { ...cors, ...data.headers });
   return json({ content: data.json?.choices?.[0]?.message?.content || '' }, 200, cors);
 }
 
@@ -107,7 +288,11 @@ async function groqVision(request, env, cors, apiKey) {
     }
   }
 
-  const instruction = String(body.prompt || DEFAULT_VISION_PROMPT).slice(0, 4000);
+  const evidenceContext = sanitiseEvidenceContext(body.evidenceContext);
+
+  const instruction = `${String(body.prompt || DEFAULT_VISION_PROMPT).slice(0, 4000)}\n`
+    + `Evidence capture context: ${JSON.stringify(evidenceContext)}. `
+    + 'Use this only to locate the scene; do not treat the auditor notes as proof of equipment or condition.';
   const content = [
     { type: 'text', text: instruction },
     ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
@@ -123,7 +308,7 @@ async function groqVision(request, env, cors, apiKey) {
     max_completion_tokens: 1200,
     response_format: { type: 'json_object' },
   });
-  if (data.error) return json({ error: data.error }, data.status, cors);
+  if (data.error) return json({ error: data.error }, data.status, { ...cors, ...data.headers });
   const parsed = safeJson(data.json?.choices?.[0]?.message?.content);
   return json({ detections: parsed?.detections ?? parsed ?? [] }, 200, cors);
 }
@@ -137,6 +322,18 @@ async function groqReason(request, env, cors, apiKey) {
   const profile = body.buildingProfile || {};
   const detected = Array.isArray(body.detected) ? body.detected.slice(0, 40) : [];
   const docs = Array.isArray(body.docs) ? body.docs.slice(0, 30) : [];
+  const evidenceContext = sanitiseEvidenceContext(body.evidenceContext);
+  const observedTypes = [...new Set(detected.map((item) => String(item?.type || '')))]
+    .filter((type) => VISUAL_GUIDANCE_QUERIES[type])
+    .slice(0, 12);
+  const observedGuidance = await Promise.all(observedTypes.map(async (type) => {
+    try {
+      const result = await queryNbc(env, VISUAL_GUIDANCE_QUERIES[type], { k: 5, hops: 1 });
+      return { type, results: result.results };
+    } catch (error) {
+      return { type, error: 'NBCS guidance lookup failed' };
+    }
+  }));
 
   const tools = [{
     type: 'function',
@@ -147,7 +344,8 @@ async function groqReason(request, env, cors, apiKey) {
         + 'protection matrix (Table 7), spacing/coverage rules and IS references '
         + 'relevant to a system, occupancy or clause. Call once per system you must '
         + 'assess (extinguishers, sprinklers, detection/alarm, hydrant/wet-riser, '
-        + 'exit signage & emergency lighting, fire doors, refuge/compartmentation).',
+        + 'exit signage & emergency lighting, fire doors, fire pumps/inlets, kitchen '
+        + 'suppression, evacuation information, refuge/compartmentation).',
       parameters: {
         type: 'object',
         properties: {
@@ -161,7 +359,13 @@ async function groqReason(request, env, cors, apiKey) {
 
   const messages = [
     { role: 'system', content: REASON_SYSTEM },
-    { role: 'user', content: JSON.stringify({ buildingProfile: profile, detectedEquipment: detected, documents: docs }) },
+    { role: 'user', content: JSON.stringify({
+      buildingProfile: profile,
+      evidenceContext,
+      detectedEquipment: detected,
+      observedEquipmentGuidance: observedGuidance,
+      documents: docs,
+    }) },
   ];
 
   // Tool-calling loop: let gpt-oss pull the exact clauses it needs.
@@ -175,7 +379,7 @@ async function groqReason(request, env, cors, apiKey) {
       max_completion_tokens: 1500,
       include_reasoning: false,
     });
-    if (data.error) return json({ error: data.error }, data.status, cors);
+    if (data.error) return json({ error: data.error }, data.status, { ...cors, ...data.headers });
 
     const msg = data.json?.choices?.[0]?.message;
     if (!msg) return json({ error: 'empty model response' }, 502, cors);
@@ -213,7 +417,7 @@ async function groqReason(request, env, cors, apiKey) {
     include_reasoning: false,
     response_format: { type: 'json_object' },
   });
-  if (finalData.error) return json({ error: finalData.error }, finalData.status, cors);
+  if (finalData.error) return json({ error: finalData.error }, finalData.status, { ...cors, ...finalData.headers });
   const verdict = safeJson(finalData.json?.choices?.[0]?.message?.content) || {};
   return json(verdict, 200, cors);
 }
@@ -249,7 +453,11 @@ async function callGroq(apiKey, payload) {
   try { body = await upstream.json(); } catch { body = null; }
   if (!upstream.ok) {
     console.error(JSON.stringify({ message: 'Groq call failed', status: upstream.status, model: payload.model }));
-    return { error: `Groq call failed (${upstream.status})`, status: upstream.status };
+    return {
+      error: `Groq call failed (${upstream.status})`,
+      status: upstream.status,
+      headers: groqRateLimitHeaders(upstream.headers),
+    };
   }
   return { json: body };
 }
@@ -259,11 +467,20 @@ const VISION_SYSTEM =
   'You are a fire-safety equipment inspector analysing site photos. Report only '
   + 'what is visibly present. Do not infer compliance. Respond with strict JSON.';
 
+const CHAT_SYSTEM =
+  'You are FireShield AI, a concise fire and life-safety assistant grounded in '
+  + 'NBCS 2026 Part F (India). Use only the supplied NBCS index results for '
+  + 'specific regulatory claims. Cite the source page when a result supports '
+  + 'your answer. If the supplied results are insufficient, say that the rule '
+  + 'could not be verified instead of inventing a clause, distance or threshold.';
+
 const DEFAULT_VISION_PROMPT =
   'Identify fire-safety equipment in these images. For each item return an object '
   + '{type, count, condition, label, confidence}. `type` must be one of: '
-  + 'extinguisher, sprinkler, detector, manual_call_point, alarm_panel, '
-  + 'exit_sign, emergency_light, fire_door, hydrant_hose_reel, fire_pump, other. '
+  + 'extinguisher, sprinkler, smoke_detector, heat_detector, manual_call_point, '
+  + 'alarm_sounder_strobe, alarm_panel, exit_sign, emergency_light, fire_door, '
+  + 'door_closer, hydrant_hose_reel, landing_valve, kitchen_suppression, '
+  + 'fire_pump, fire_department_connection, evacuation_map, other. '
   + '`count` = how many of that type are visible across the images. `condition` = '
   + 'short note (e.g. "gauge in green", "obstructed", "expired tag", "unknown"). '
   + '`label` = any readable text/rating (e.g. "ABC 6kg", "120 min"). '
@@ -276,7 +493,12 @@ const REASON_SYSTEM =
   + 'height and area, then use the query_nbc tool to fetch the exact requirement '
   + '(counts, spacing, coverage, Table 7 protection level, IS references) for each. '
   + 'Compare required vs observed. Never invent a requirement or a pass: if the photos '
-  + 'do not establish a fact, mark it cannot_verify. Cite the clause id and page from '
+  + 'do not establish a fact, mark it cannot_verify. A missing visual detection is not '
+  + 'proof that equipment is absent unless the evidence explicitly documents complete '
+  + 'coverage of the relevant floor/area. CLIPSeg supplies object-location evidence only; '
+  + 'Qwen condition notes may be used as observations but not as measurements or certificates. '
+  + 'For every observed equipment class, query the applicable inspection/placement guidance. '
+  + 'Cite the clause id and page from '
   + 'the tool results. Call query_nbc once per system before concluding.';
 
 const FINAL_INSTRUCTION =
@@ -288,11 +510,69 @@ const FINAL_INSTRUCTION =
   + '"citedClauses": [{"id": string, "title": string, "page": number}]}. '
   + 'Base every finding only on the query_nbc tool results already gathered.';
 
+const PLAN_REASON_SYSTEM =
+  'You are FireShield AI assessing a reconstructed building plan against NBCS 2026 Part F (India). '
+  + 'The geometry was extracted deterministically and reviewed by Qwen. Treat Qwen as a visual reviewer, '
+  + 'not as a code authority. Use only the supplied NBCS guidance for regulatory requirements and cite its '
+  + 'page and clause identifiers. Never infer scale, occupancy, door purpose, exit designation, fire rating, '
+  + 'travel path, stair discharge, or protection equipment when the structured plan does not establish it. '
+  + 'If units are px or the Qwen review is insufficient, measurements are cannot_verify. A missing detected '
+  + 'object is not proof of absence. Return JSON only: {"planSummary":string,"score":number|null,'
+  + '"findings":[{"check":string,"status":"compliant"|"gap"|"critical_gap"|"cannot_verify",'
+  + '"severity":"minor"|"major"|"critical","observed":string,"required":string,"measurementEvidence":string,'
+  + '"clauseId":string,"page":number|null,"rationale":string}],'
+  + '"citedClauses":[{"id":string,"title":string,"page":number}],"limitations":[string]}. '
+  + 'Only assign a numeric score when enough checks are verifiable; otherwise score must be null.';
+
 // ── Shared helpers (from the Cloudflare-Groq skill) ──────────────────────────
 async function readSecret(binding) {
   if (!binding) return '';
   if (typeof binding === 'string') return binding;
   return binding.get();
+}
+async function enforceGroqRateLimit(path, env, cors) {
+  const isVision = path === '/groq/vision';
+  const limiter = isVision ? env.VISION_RATE_LIMITER : env.REASON_RATE_LIMITER;
+  if (!limiter) {
+    return json({ error: 'rate limiter is not configured' }, 503, cors);
+  }
+
+  // A reasoning request can make four tool-loop calls plus one final verdict.
+  // Reserve those calls against the shared gpt-oss budget before doing work.
+  const units = path === '/groq/reason' ? MAX_TOOL_HOPS + 1 : 1;
+  const key = isVision ? 'qwen/qwen3.6-27b' : 'openai/gpt-oss-120b';
+  for (let i = 0; i < units; i++) {
+    const result = await limiter.limit({ key });
+    if (!result.success) {
+      console.warn(JSON.stringify({ message: 'rate limited', path, model: key }));
+      return json({
+        error: 'AI request rate limit exceeded',
+        retryAfterSeconds: 60,
+      }, 429, {
+        ...cors,
+        'Retry-After': '60',
+        'X-RateLimit-Policy': '25;w=60',
+      });
+    }
+  }
+  return null;
+}
+function groqRateLimitHeaders(headers) {
+  const names = [
+    'retry-after',
+    'x-ratelimit-limit-requests',
+    'x-ratelimit-limit-tokens',
+    'x-ratelimit-remaining-requests',
+    'x-ratelimit-remaining-tokens',
+    'x-ratelimit-reset-requests',
+    'x-ratelimit-reset-tokens',
+  ];
+  const forwarded = {};
+  for (const name of names) {
+    const value = headers.get(name);
+    if (value) forwarded[name] = value;
+  }
+  return forwarded;
 }
 function tooLarge(request, max) {
   return Number(request.headers.get('content-length') || 0) > max;
@@ -300,6 +580,17 @@ function tooLarge(request, max) {
 function safeJson(str) {
   if (!str) return null;
   try { return JSON.parse(str); } catch { return null; }
+}
+function sanitiseEvidenceContext(value) {
+  const raw = value && typeof value === 'object' ? value : {};
+  return {
+    level: String(raw.level || '').slice(0, 80),
+    zone: String(raw.zone || '').slice(0, 160),
+    purpose: String(raw.purpose || '').slice(0, 80),
+    coverage: ['spot_check', 'complete_area'].includes(raw.coverage) ? raw.coverage : 'spot_check',
+    notes: String(raw.notes || '').slice(0, 500),
+    imageCount: Math.max(0, Math.min(Number(raw.imageCount) || 0, 5)),
+  };
 }
 function allowedOrigins(env) {
   return String(env.ALLOWED_ORIGINS || '').split(',').map((v) => v.trim()).filter(Boolean);
@@ -310,7 +601,7 @@ function isAllowedOrigin(origin, env) {
 function corsHeaders(origin, env) {
   const headers = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
     'X-Content-Type-Options': 'nosniff',

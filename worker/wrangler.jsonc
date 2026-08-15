@@ -1,7 +1,7 @@
 {
   // FireShield secure Groq gateway.
-  // Fill the <PLACEHOLDERS> after verifying the account with `wrangler whoami`.
-  // NEVER put GROQ_API_KEY here — it lives in Secrets Store and is bound below.
+  // GROQ_API_KEY is added after deploy via `wrangler secret put GROQ_API_KEY`
+  // (masked prompt — never in this file, never in shell history).
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "fireshield-groq-gateway",
   "main": "src/worker.js",
@@ -9,36 +9,49 @@
   "compatibility_flags": ["nodejs_compat"],
 
   "vars": {
-    // Browser Origin is scheme+host only (no repo path). Comma-separate dev origins.
-    "ALLOWED_ORIGINS": "https://<OWNER>.github.io,http://localhost:8787,http://localhost:5000",
+    "ALLOWED_ORIGINS": "https://thevikram123.github.io,http://localhost:8787,http://localhost:5000",
     "GROQ_VISION_MODEL": "qwen/qwen3.6-27b",
     "GROQ_REASON_MODEL": "openai/gpt-oss-120b",
-    "NBC_INDEX_KEY": "nbc_query_index.json"
+    "FLOORPLAN_SERVICE_URL": "https://fireshield-floorplan-api.onrender.com",
+    "NBC_INDEX_KEY": "nbc_query_index"
   },
 
-  // GROQ_API_KEY from Secrets Store (reuse the existing store on this account).
+  // Reuse the existing GROQ_API_KEY already in this account's Secrets Store.
   "secrets_store_secrets": [
     {
       "binding": "GROQ_API_KEY",
-      "store_id": "<STORE_ID>",
+      "store_id": "e0660ebafc5e4cc99716ab5d12e72d6f",
       "secret_name": "GROQ_API_KEY"
     }
   ],
 
-  // NBC 2026 graph query index (worker/data/nbc_query_index.json, ~2.4 MB).
-  // Create the bucket, then upload the object (see README).
-  "r2_buckets": [
+  // NBC 2026 graph query index (worker/data/nbc_query_index.json, ~2.4 MB)
+  // stored in Workers KV. The namespace id is filled in after `kv namespace create`.
+  "kv_namespaces": [
     {
-      "binding": "NBC_BUCKET",
-      "bucket_name": "fireshield-nbc-index"
+      "binding": "NBC_KV",
+      "id": "a0a33bf166454acdbcb275d409528f87"
     }
   ],
 
+  // Groq Free Plan is 30 RPM per configured model. Keep a five-request
+  // reserve for retries/other clients. REASON_RATE_LIMITER is shared by
+  // /groq/chat and /groq/reason because both use openai/gpt-oss-120b.
   "ratelimits": [
     {
-      "name": "GROQ_RATE_LIMITER",
+      "name": "REASON_RATE_LIMITER",
       "namespace_id": "53020",
-      "simple": { "limit": 20, "period": 60 }
+      "simple": { "limit": 25, "period": 60 }
+    },
+    {
+      "name": "VISION_RATE_LIMITER",
+      "namespace_id": "53021",
+      "simple": { "limit": 25, "period": 60 }
+    },
+    {
+      "name": "PLAN_RATE_LIMITER",
+      "namespace_id": "53022",
+      "simple": { "limit": 5, "period": 60 }
     }
   ],
 

@@ -14,6 +14,8 @@ import 'screens/fs_add_facility_screen.dart';
 import 'screens/fs_admin_dashboard.dart';
 import 'screens/fs_auditor_dashboard.dart';
 import 'screens/fs_ai_audit_engine_screen.dart';
+import 'screens/fs_ai_workspace_screen.dart';
+import 'screens/fs_floorplan_screen.dart';
 import 'screens/fs_assign_audit_screen.dart';
 import 'screens/fs_audit_screens.dart';
 import 'screens/fs_building_classification_screen.dart';
@@ -68,26 +70,33 @@ final GoRouter fsRouter = GoRouter(
 
     // ── Admin ──
     _page('/admin', 'Admin Dashboard', const FsAdminDashboard(), bare: true),
-    _page('/admin/orgs', 'Organisations',
-        const FsAdminDashboard(tab: 'orgs'), bare: true),
+    _page('/admin/orgs', 'Organisations', const FsAdminDashboard(tab: 'orgs'),
+        bare: true),
     _page('/admin/analytics', 'Analytics',
-        const FsAdminDashboard(tab: 'analytics'), bare: true),
-    _page('/admin/activity', 'Activity',
-        const FsAdminDashboard(tab: 'activity'), bare: true),
-    _page('/admin/register-org', 'Register Organisation', const FsRegisterOrgScreen()),
-    _page('/admin/classify', 'Building Classification', const FsBuildingClassificationScreen()),
+        const FsAdminDashboard(tab: 'analytics'),
+        bare: true),
+    _page(
+        '/admin/activity', 'Activity', const FsAdminDashboard(tab: 'activity'),
+        bare: true),
+    _page('/admin/register-org', 'Register Organisation',
+        const FsRegisterOrgScreen()),
+    _page('/admin/classify', 'Building Classification',
+        const FsBuildingClassificationScreen()),
     _page('/admin/create-user', 'Create User', const FsCreateUserScreen()),
 
     // ── Org Admin ──
     _page('/orgadmin', 'Org Admin Dashboard', const FsOrgAdminDashboard(),
         bare: true),
     _page('/orgadmin/facilities', 'Facilities',
-        const FsOrgAdminDashboard(tab: 'facilities'), bare: true),
-    _page('/orgadmin/team', 'Team',
-        const FsOrgAdminDashboard(tab: 'team'), bare: true),
-    _page('/orgadmin/audits', 'Audits',
-        const FsOrgAdminDashboard(tab: 'audits'), bare: true),
-    _page('/orgadmin/add-facility', 'Add Facility', const FsAddFacilityScreen()),
+        const FsOrgAdminDashboard(tab: 'facilities'),
+        bare: true),
+    _page('/orgadmin/team', 'Team', const FsOrgAdminDashboard(tab: 'team'),
+        bare: true),
+    _page(
+        '/orgadmin/audits', 'Audits', const FsOrgAdminDashboard(tab: 'audits'),
+        bare: true),
+    _page(
+        '/orgadmin/add-facility', 'Add Facility', const FsAddFacilityScreen()),
     _page('/orgadmin/create-user', 'Create User', const FsCreateUserScreen()),
 
     // ── Safety Manager ──
@@ -98,9 +107,12 @@ final GoRouter fsRouter = GoRouter(
     _page('/manager/assign', 'Assign Audit', const FsAssignAuditScreen()),
     _page('/manager/add-facility', 'Add Facility', const FsAddFacilityScreen()),
     _page('/manager/noc', 'NOC Readiness', const FsNocReadinessScreen()),
-    _page('/manager/equipment', 'Equipment Inventory', const FsEquipmentInventoryScreen()),
-    _page('/manager/training', 'Training & Drills', const FsTrainingDrillsScreen()),
-    _page('/manager/upload-documents', 'Upload Documents', const FsUploadDocumentsScreen()),
+    _page('/manager/equipment', 'Equipment Inventory',
+        const FsEquipmentInventoryScreen()),
+    _page('/manager/training', 'Training & Drills',
+        const FsTrainingDrillsScreen()),
+    _page('/manager/upload-documents', 'Upload Documents',
+        const FsUploadDocumentsScreen()),
 
     // ── Auditor ──
     _page('/auditor', 'Auditor Dashboard', const FsAuditorDashboard(),
@@ -109,15 +121,16 @@ final GoRouter fsRouter = GoRouter(
         bare: true),
 
     // ── Government ──
-    _page('/govt', 'Government Dashboard', const FsGovtDashboard(),
-        bare: true),
+    _page('/govt', 'Government Dashboard', const FsGovtDashboard(), bare: true),
 
     // ── Shared ──
+    _page('/ai-workspace', 'AI Workspace', const FsAiWorkspaceScreen()),
     _page('/ai-engine', 'AI Audit Engine', const FsAiAuditEngineScreen()),
     _page('/audit', 'Audit Execution', const FsAuditExecution()),
     _page('/audit/summary', 'Audit Summary', const FsAuditSummary()),
     _page('/reports', 'Reports', const FsReportsScreen()),
     _page('/ai', 'AI Assistant', const FsAiAssistant()),
+    _page('/floorplan', 'Building Plan Assessment', const FsFloorplanScreen()),
     _page('/reference', 'Reference Library', const FsReferenceLibrary()),
     _page('/profile', 'Profile', const FsProfileScreen()),
   ],
@@ -175,27 +188,27 @@ class FsScaffold extends StatelessWidget {
       appBar: bare
           ? null
           : TopBar(
-        title: title,
-        subtitle: subtitle ?? user?.facility,
-        right: user == null
-            ? null
-            : Container(
-                width: 34,
-                height: 34,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: FsColors.primary,
-                  borderRadius: BorderRadius.circular(FsRadius.xl),
-                ),
-                child: Text(
-                  user.initials,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
+              title: title,
+              subtitle: subtitle ?? user?.facility,
+              right: user == null
+                  ? null
+                  : Container(
+                      width: 34,
+                      height: 34,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: FsColors.primary,
+                        borderRadius: BorderRadius.circular(FsRadius.xl),
+                      ),
+                      child: Text(
+                        user.initials,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
             ),
       body: child,
       floatingActionButton: floatingAction,
@@ -238,8 +251,7 @@ class FsPendingScreen extends StatelessWidget {
                         color: FsColors.warningLight,
                         borderRadius: BorderRadius.circular(FsRadius.xl),
                       ),
-                      child: const Text('🚧',
-                          style: TextStyle(fontSize: 18)),
+                      child: const Text('🚧', style: TextStyle(fontSize: 18)),
                     ),
                     const SizedBox(width: 12),
                     Expanded(

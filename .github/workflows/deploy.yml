@@ -30,17 +30,17 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # FIRESHIELD_WORKER_URL is an optional repo variable
-      # (Settings → Secrets and variables → Actions → Variables). Set it after
-      # the Cloudflare Worker is deployed; until then the AI phases show an
-      # explicit "not configured" state instead of faking results.
+      # Repository variables can override the checked-in public endpoints.
+      # Groq/service-role secrets never enter this build.
       - name: Build web (FireShield target)
         run: >
           flutter build web
           -t lib/fireshield_main.dart
           --release
           --base-href /fireshield/
-          --dart-define=FIRESHIELD_WORKER_URL=${{ vars.FIRESHIELD_WORKER_URL }}
+          --dart-define=FIRESHIELD_WORKER_URL=${{ vars.FIRESHIELD_WORKER_URL || 'https://fireshield-groq-gateway.thevikram123.workers.dev' }}
+          --dart-define=SUPABASE_URL=${{ vars.SUPABASE_URL || 'https://dhchsufskqecoelrdhwa.supabase.co' }}
+          --dart-define=SUPABASE_PUBLISHABLE_KEY=${{ vars.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_G9MwIp8usNm-7povOkNLWg_fFqubU9L' }}
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

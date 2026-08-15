@@ -20,7 +20,7 @@ const Map<FsRole, List<FsNavTab>> fsNavTabs = {
     FsNavTab('/admin', '⊞', 'Dashboard'),
     FsNavTab('/admin/orgs', '🏢', 'Orgs'),
     FsNavTab('/admin/analytics', '📊', 'Analytics'),
-    FsNavTab('/ai', '🤖', 'AI'),
+    FsNavTab('/ai-workspace', '🤖', 'AI'),
     FsNavTab('/profile', '👤', 'Profile'),
   ],
   FsRole.manager: [
@@ -28,13 +28,14 @@ const Map<FsRole, List<FsNavTab>> fsNavTabs = {
     FsNavTab('/manager/audits', '📋', 'Audits'),
     FsNavTab('/reference', '📚', 'Reference'),
     FsNavTab('/reports', '📄', 'Reports'),
+    FsNavTab('/ai-workspace', '🤖', 'AI'),
     FsNavTab('/profile', '👤', 'Profile'),
   ],
   FsRole.auditor: [
     FsNavTab('/auditor', '⊞', 'Dashboard'),
     FsNavTab('/auditor/audits', '📋', 'My Audits'),
     FsNavTab('/reference', '📚', 'Reference'),
-    FsNavTab('/ai', '🤖', 'AI'),
+    FsNavTab('/ai-workspace', '🤖', 'AI'),
     FsNavTab('/profile', '👤', 'Profile'),
   ],
   FsRole.orgadmin: [
@@ -42,6 +43,14 @@ const Map<FsRole, List<FsNavTab>> fsNavTabs = {
     FsNavTab('/orgadmin/facilities', '🏢', 'Facilities'),
     FsNavTab('/orgadmin/team', '👥', 'Team'),
     FsNavTab('/orgadmin/audits', '📋', 'Audits'),
+    FsNavTab('/ai-workspace', '🤖', 'AI'),
+    FsNavTab('/profile', '👤', 'Profile'),
+  ],
+  FsRole.govt: [
+    FsNavTab('/govt', '⊞', 'Dashboard'),
+    FsNavTab('/reference', '📚', 'Reference'),
+    FsNavTab('/reports', '📄', 'Reports'),
+    FsNavTab('/ai-workspace', '🤖', 'AI'),
     FsNavTab('/profile', '👤', 'Profile'),
   ],
 };

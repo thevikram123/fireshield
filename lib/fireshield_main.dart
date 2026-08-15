@@ -5,7 +5,18 @@
 library;
 
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'fireshield/fs_app.dart';
+import 'fireshield/services/fs_config.dart';
 
-void main() => runApp(const FireShieldApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (isSupabaseConfigured) {
+    await Supabase.initialize(
+      url: supabaseUrl,
+      publishableKey: supabasePublishableKey,
+    );
+  }
+  runApp(const FireShieldApp());
+}

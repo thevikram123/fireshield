@@ -4,7 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:fire_audit_demo/data/checkpoint_model.dart';
 import 'package:fire_audit_demo/data/nbc_bis_masterdata.dart';
 import 'package:fire_audit_demo/fireshield/data/fs_mock_data.dart';
-import 'package:fire_audit_demo/fireshield/data/fs_models.dart';
+import 'package:fire_audit_demo/fireshield/data/fs_models.dart' hide FsAuditRun;
 import 'package:fire_audit_demo/fireshield/fs_app_state.dart';
 import 'package:fire_audit_demo/fireshield/screens/fs_audit_screens.dart';
 import 'package:fire_audit_demo/fireshield/screens/fs_admin_dashboard.dart';

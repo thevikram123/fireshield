@@ -19,13 +19,22 @@ import 'fs_clipseg_interop_stub.dart'
 const Map<String, String> kClipsegPrompts = {
   'extinguisher': 'a red fire extinguisher cylinder',
   'sprinkler': 'a ceiling fire sprinkler head',
-  'detector': 'a ceiling smoke or heat detector',
+  'smoke_detector': 'a round smoke detector mounted on a ceiling',
+  'heat_detector': 'a heat detector mounted on a ceiling',
   'manual_call_point': 'a red manual call point break-glass alarm',
+  'alarm_sounder_strobe': 'a fire alarm sounder or red alarm strobe',
   'alarm_panel': 'a fire alarm control panel on the wall',
   'exit_sign': 'an illuminated green exit sign',
   'emergency_light': 'an emergency light fitting',
-  'fire_door': 'a fire door',
-  'hydrant_hose_reel': 'a fire hose reel or hydrant',
+  'fire_door': 'a labelled self-closing fire door',
+  'door_closer': 'a hydraulic door closer on top of a fire door',
+  'hydrant_hose_reel': 'a red fire hose reel inside a cabinet',
+  'landing_valve': 'a fire hydrant landing valve or wet riser outlet',
+  'kitchen_suppression': 'a commercial kitchen hood fire suppression nozzle',
+  'fire_pump': 'a red fire water pump with pipework',
+  'fire_department_connection':
+      'a fire brigade inlet or fire department connection',
+  'evacuation_map': 'a wall-mounted fire evacuation plan map',
 };
 
 class FsClipsegService {
@@ -48,7 +57,8 @@ class FsClipsegService {
   }
 
   /// Detect across a batch, summing counts per type.
-  Future<List<DetectedEquipment>> detectBatch(List<String> imageDataUrls) async {
+  Future<List<DetectedEquipment>> detectBatch(
+      List<String> imageDataUrls) async {
     if (!supported) return const [];
     final byType = <String, DetectedEquipment>{};
     for (final url in imageDataUrls) {
