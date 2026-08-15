@@ -1,0 +1,19 @@
+{
+  "name": "fireshield-groq-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Secure Cloudflare Worker proxying Groq vision + reasoning for FireShield, with a live NBCS 2026 graph query tool.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "wrangler types",
+    "dry-run": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail fireshield-groq-gateway",
+    "index:build": "python ../tool/gen_nbc_query_index.py",
+    "index:upload": "wrangler r2 object put fireshield-nbc-index/nbc_query_index.json --file ./data/nbc_query_index.json --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,49 @@
+{
+  // FireShield secure Groq gateway.
+  // Fill the <PLACEHOLDERS> after verifying the account with `wrangler whoami`.
+  // NEVER put GROQ_API_KEY here — it lives in Secrets Store and is bound below.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "fireshield-groq-gateway",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-15",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "vars": {
+    // Browser Origin is scheme+host only (no repo path). Comma-separate dev origins.
+    "ALLOWED_ORIGINS": "https://<OWNER>.github.io,http://localhost:8787,http://localhost:5000",
+    "GROQ_VISION_MODEL": "qwen/qwen3.6-27b",
+    "GROQ_REASON_MODEL": "openai/gpt-oss-120b",
+    "NBC_INDEX_KEY": "nbc_query_index.json"
+  },
+
+  // GROQ_API_KEY from Secrets Store (reuse the existing store on this account).
+  "secrets_store_secrets": [
+    {
+      "binding": "GROQ_API_KEY",
+      "store_id": "<STORE_ID>",
+      "secret_name": "GROQ_API_KEY"
+    }
+  ],
+
+  // NBC 2026 graph query index (worker/data/nbc_query_index.json, ~2.4 MB).
+  // Create the bucket, then upload the object (see README).
+  "r2_buckets": [
+    {
+      "binding": "NBC_BUCKET",
+      "bucket_name": "fireshield-nbc-index"
+    }
+  ],
+
+  "ratelimits": [
+    {
+      "name": "GROQ_RATE_LIMITER",
+      "namespace_id": "53020",
+      "simple": { "limit": 20, "period": 60 }
+    }
+  ],
+
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 }
+  }
+}
