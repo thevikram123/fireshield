@@ -37,6 +37,11 @@ def write_overlay(rgb: np.ndarray, model: FloorplanModel, path: str | Path) -> P
         if pts is not None:
             cv2.polylines(canvas, [pts], True, (0, 128, 255), 2)
 
+    for trace in model.traces:
+        pts = _cv_pts(trace.points)
+        if pts is not None:
+            cv2.polylines(canvas, [pts], trace.closed, (190, 150, 40), 1)
+
     for window in model.windows:
         pts = _cv_pts(window.quad)
         if pts is not None:

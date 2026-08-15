@@ -36,7 +36,8 @@ def health():
         "ok": True,
         "service": "fireshield-floorplan",
         "qwenConfigured": bool(os.environ.get("GROQ_API_KEY")),
-        "openrouterCorrectionConfigured": bool(os.environ.get("OPENROUTER_API_KEY")),
+        "visionPasses": 2,
+        "reasoningModel": "openai/gpt-oss-120b",
         "requestScopedQwenSupported": True,
         "serviceTokenConfigured": bool(os.environ.get("FLOORPLAN_SERVICE_TOKEN")),
         "cubicCasaEnabled": os.environ.get("ENABLE_NONCOMMERCIAL_CUBICASA") == "1",
@@ -73,7 +74,6 @@ async def convert_plan(
         try:
             guide = QwenTopologyGuide(
                 api_key=groq_api_key,
-                openrouter_api_key=os.environ.get("OPENROUTER_API_KEY"),
                 building_profile=profile,
             )
         except RuntimeError as exc:

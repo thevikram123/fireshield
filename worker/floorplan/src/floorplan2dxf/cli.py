@@ -94,7 +94,6 @@ def main(argv: list[str] | None = None) -> int:
 
         guide = QwenTopologyGuide(
             api_key=os.environ.get("GROQ_API_KEY"),
-            openrouter_api_key=os.environ.get("OPENROUTER_API_KEY"),
             enable_correction=not args.no_ai_correction,
             building_profile=building_profile,
         )

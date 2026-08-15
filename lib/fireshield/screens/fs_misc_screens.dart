@@ -6,6 +6,7 @@
 library;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../data/checkpoint_model.dart';
@@ -64,8 +65,8 @@ class FsProfileScreen extends StatelessWidget {
                     Text(user.name, style: FsText.title),
                     const SizedBox(height: 2),
                     Text(user.role.label,
-                        style: FsText.small
-                            .copyWith(fontWeight: FontWeight.w600)),
+                        style:
+                            FsText.small.copyWith(fontWeight: FontWeight.w600)),
                     const SizedBox(height: 2),
                     Text(user.email, style: FsText.tiny),
                   ],
@@ -93,8 +94,7 @@ class FsProfileScreen extends StatelessWidget {
             children: [
               _tile('🔔', 'Notifications', () {}),
               _tile('🔒', 'Security & MFA', () {}),
-              _tile('📚', 'Reference Library',
-                  () => context.go('/reference')),
+              _tile('📚', 'Reference Library', () => context.go('/reference')),
               _tile('ℹ️', 'About FireShield AI', () {}, last: true),
             ],
           ),
@@ -132,8 +132,7 @@ class FsProfileScreen extends StatelessWidget {
         decoration: BoxDecoration(
           border: last
               ? null
-              : const Border(
-                  bottom: BorderSide(color: FsColors.border)),
+              : const Border(bottom: BorderSide(color: FsColors.border)),
         ),
         child: Row(
           children: [
@@ -164,8 +163,7 @@ class FsProfileScreen extends StatelessWidget {
           decoration: BoxDecoration(
             border: last
                 ? null
-                : const Border(
-                    bottom: BorderSide(color: FsColors.border)),
+                : const Border(bottom: BorderSide(color: FsColors.border)),
           ),
           child: Row(
             children: [
@@ -174,11 +172,9 @@ class FsProfileScreen extends StatelessWidget {
               Expanded(
                 child: Text(label,
                     style: FsText.small.copyWith(
-                        fontWeight: FontWeight.w600,
-                        color: FsColors.gray900)),
+                        fontWeight: FontWeight.w600, color: FsColors.gray900)),
               ),
-              const Icon(Icons.chevron_right,
-                  size: 18, color: FsColors.subtle),
+              const Icon(Icons.chevron_right, size: 18, color: FsColors.subtle),
             ],
           ),
         ),
@@ -191,12 +187,37 @@ class FsReportsScreen extends StatelessWidget {
   const FsReportsScreen({super.key});
 
   static const _reports = [
-    ('📄', 'Audit Summary Report', 'PDF · 12–18 pages', 'Full findings, scores and evidence index'),
-    ('🏆', 'NOC Readiness Certificate', 'PDF · Official Format', 'Regulator-ready readiness statement'),
-    ('📊', 'Risk Register', 'NBC 2026 Gap Mapping', 'Every open gap mapped to its clause'),
-    ('🏛️', 'Govt Submission Package', 'Regulatory Format', 'Bundle for the local fire authority'),
+    (
+      '📄',
+      'Audit Summary Report',
+      'PDF · 12–18 pages',
+      'Full findings, scores and evidence index'
+    ),
+    (
+      '🏆',
+      'NOC Readiness Certificate',
+      'PDF · Official Format',
+      'Regulator-ready readiness statement'
+    ),
+    (
+      '📊',
+      'Risk Register',
+      'NBC 2026 Gap Mapping',
+      'Every open gap mapped to its clause'
+    ),
+    (
+      '🏛️',
+      'Govt Submission Package',
+      'Regulatory Format',
+      'Bundle for the local fire authority'
+    ),
     ('📈', 'Compliance Trend', 'XLSX · 6 months', 'Score movement by facility'),
-    ('⚠️', 'CAPA Status Report', 'PDF · Live', 'Open, overdue and closed actions'),
+    (
+      '⚠️',
+      'CAPA Status Report',
+      'PDF · Live',
+      'Open, overdue and closed actions'
+    ),
   ];
 
   @override
@@ -204,8 +225,8 @@ class FsReportsScreen extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
         children: [
           Text('AVAILABLE REPORTS',
-              style: FsText.xs.copyWith(
-                  fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+              style: FsText.xs
+                  .copyWith(fontWeight: FontWeight.w700, letterSpacing: 0.8)),
           const SizedBox(height: 10),
           ..._reports.map(
             (r) => Padding(
@@ -342,12 +363,11 @@ class _FsReferenceLibraryState extends State<FsReferenceLibrary> {
                             Row(
                               children: [
                                 Text(c.id,
-                                    style: FsText.tiny.copyWith(
-                                        fontWeight: FontWeight.w700)),
+                                    style: FsText.tiny
+                                        .copyWith(fontWeight: FontWeight.w700)),
                                 const SizedBox(width: 8),
                                 StatusBadge(
-                                    status:
-                                        c.severity.label.toUpperCase()),
+                                    status: c.severity.label.toUpperCase()),
                                 const Spacer(),
                                 Text(c.standardLabel,
                                     style: FsText.micro
@@ -359,8 +379,7 @@ class _FsReferenceLibraryState extends State<FsReferenceLibrary> {
                             const SizedBox(height: 4),
                             Text(c.description, style: FsText.small),
                             const SizedBox(height: 6),
-                            Text('Evidence: ${c.evidence}',
-                                style: FsText.tiny),
+                            Text('Evidence: ${c.evidence}', style: FsText.tiny),
                           ],
                         ),
                       ),
@@ -441,14 +460,20 @@ class _FsAiAssistantState extends State<FsAiAssistant> {
           .toList();
       final answer = await _service.chat(history);
       if (!mounted) return;
-      setState(() => _messages.add((false,
-          answer.isEmpty ? 'The AI service returned an empty response.' : answer)));
+      setState(() => _messages.add((
+            false,
+            answer.isEmpty
+                ? 'The AI service returned an empty response.'
+                : answer
+          )));
     } on FsServiceException catch (error) {
       if (!mounted) return;
-      setState(() => _messages.add((false,
-          error.status == 429
-              ? 'The AI request limit was reached. Please wait about a minute and try again.'
-              : 'AI assistant unavailable: ${error.message}')));
+      setState(() => _messages.add((
+            false,
+            error.status == 429
+                ? 'The AI request limit was reached. Please wait about a minute and try again.'
+                : 'AI assistant unavailable: ${error.message}'
+          )));
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -474,18 +499,40 @@ class _FsAiAssistantState extends State<FsAiAssistant> {
                       color: mine ? FsColors.primary : FsColors.card,
                       borderRadius: BorderRadius.circular(FsRadius.xl2),
                       border: Border.all(
-                          color: mine
-                              ? FsColors.primary
-                              : FsColors.border),
+                          color: mine ? FsColors.primary : FsColors.border),
                       boxShadow: mine ? null : FsShadows.card,
                     ),
-                    child: Text(
-                      text,
-                      style: FsText.small.copyWith(
-                        color: mine ? Colors.white : FsColors.gray900,
-                        height: 1.5,
-                      ),
-                    ),
+                    child: mine
+                        ? Text(text,
+                            style: FsText.small
+                                .copyWith(color: Colors.white, height: 1.5))
+                        : MarkdownBody(
+                            data: text,
+                            selectable: true,
+                            styleSheet: MarkdownStyleSheet(
+                              p: FsText.small.copyWith(
+                                  color: FsColors.gray900, height: 1.5),
+                              h1: FsText.h2,
+                              h2: FsText.cardTitle,
+                              h3: FsText.small
+                                  .copyWith(fontWeight: FontWeight.w700),
+                              strong:
+                                  const TextStyle(fontWeight: FontWeight.w700),
+                              blockquote: FsText.small
+                                  .copyWith(color: FsColors.gray700),
+                              blockquoteDecoration: const BoxDecoration(
+                                color: FsColors.gray100,
+                                border: Border(
+                                  left: BorderSide(
+                                      color: FsColors.primary, width: 3),
+                                ),
+                              ),
+                              listBullet: FsText.small,
+                              code: FsText.tiny.copyWith(
+                                  fontFamily: 'monospace',
+                                  backgroundColor: FsColors.gray100),
+                            ),
+                          ),
                   ),
                 );
               },
@@ -561,8 +608,8 @@ class FsFacilitiesScreen extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
       children: [
         Text('FACILITIES · ${facilities.length}',
-            style: FsText.xs.copyWith(
-                fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+            style: FsText.xs
+                .copyWith(fontWeight: FontWeight.w700, letterSpacing: 0.8)),
         const SizedBox(height: 10),
         ...facilities.map(
           (f) => Padding(
@@ -582,16 +629,14 @@ class FsFacilitiesScreen extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 4),
-                  Text('${f.type} · ${f.city}, ${f.state}',
-                      style: FsText.tiny),
+                  Text('${f.type} · ${f.city}, ${f.state}', style: FsText.tiny),
                   const SizedBox(height: 8),
                   Row(
                     children: [
                       Expanded(
                         child: ProgressBar(
                           value: f.compliance.toDouble(),
-                          color: ScoreRing.colorFor(
-                              f.compliance.toDouble()),
+                          color: ScoreRing.colorFor(f.compliance.toDouble()),
                         ),
                       ),
                       const SizedBox(width: 10),

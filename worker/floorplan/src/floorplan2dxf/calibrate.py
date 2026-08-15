@@ -178,6 +178,11 @@ def calibrate_from_span(width_px: float, height_px: float, overall_mm: tuple[flo
 
 
 def standalone_lengths_mm(texts: Iterable[TextItem]) -> list[float]:
+    texts = list(texts)
+    metric_drawing = any(
+        re.search(r"\b(?:mts?|metres?|meters?)\b|scale\s*1\s*:\s*\d+", text.content, re.I)
+        for text in texts
+    )
     lengths: list[float] = []
     for text in texts:
         if text.parsed_mm:
@@ -186,6 +191,11 @@ def standalone_lengths_mm(texts: Iterable[TextItem]) -> list[float]:
         one = parse_length_mm(text.content)
         if one and one >= 1500:
             lengths.append(one)
+            continue
+        if metric_drawing:
+            bare = _BARE.fullmatch(normalize_dim_text(text.content))
+            if bare and 1.0 <= float(bare.group("val")) <= 100.0:
+                lengths.append(float(bare.group("val")) * 1000.0)
     return lengths
 
 

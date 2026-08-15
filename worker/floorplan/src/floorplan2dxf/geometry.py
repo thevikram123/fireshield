@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .schema import Point, Room, Wall
+from .schema import Point, Room, VectorTrace, Wall
 
 
 @dataclass
@@ -24,6 +24,7 @@ class CvGeometry:
     rooms: list[Room] = field(default_factory=list)
     envelope: tuple[float, float, float, float] | None = None  # x0,y0,x1,y1
     bars: list[DimensionBar] = field(default_factory=list)
+    traces: list[VectorTrace] = field(default_factory=list)
     wall_mask: np.ndarray | None = None
 
 
@@ -41,7 +42,11 @@ def extract_geometry(rgb: np.ndarray, wall_mask: np.ndarray) -> CvGeometry:
     rooms = rooms_from_mask(sealed)
     envelope = envelope_from_mask(structure)
     bars = find_dimension_bars(rgb)
-    return CvGeometry(walls=walls, rooms=rooms, envelope=envelope, bars=bars, wall_mask=structure)
+    traces = trace_all_lines(rgb)
+    return CvGeometry(
+        walls=walls, rooms=rooms, envelope=envelope, bars=bars,
+        traces=traces, wall_mask=structure,
+    )
 
 
 def _kernel(n: int) -> np.ndarray:
@@ -126,31 +131,24 @@ def walls_from_mask(mask: np.ndarray, min_area: int = 40) -> list[Wall]:
     work = (mask > 0).astype(np.uint8) * 255
     h, w = work.shape[:2]
     walls: list[Wall] = []
-    silhouette = _silhouette(work)
-    outer = _outer_ring(silhouette)
-    if outer:
-        xs = [p[0] for p in outer]
-        ys = [p[1] for p in outer]
-        walls.append(
-            Wall(
-                id="wall_0",
-                start=(min(xs), min(ys)),
-                end=(max(xs), min(ys)),
-                thickness_mm=8.0,
-                quad=outer,
-            )
-        )
     min_len = max(22, int(round(min(h, w) * 0.04)))
-    segs = cv2.HoughLinesP(
-        work, 1, np.pi / 180.0, threshold=36,
-        minLineLength=min_len, maxLineGap=max(8, min_len // 3),
-    )
     dist = cv2.distanceTransform(work, cv2.DIST_L2, 3)
-    merged = _merge_segments(
-        [tuple(int(v) for v in seg) for seg in np.asarray(segs).reshape(-1, 4)] if segs is not None else [],
-        min_len=min_len,
+    # Keep both filled bands and thin line evidence. Classification happens
+    # after extraction so doors, partitions and dimension evidence are not lost.
+    band_segments = _trace_wall_bands(work, min_len)
+    hough = cv2.HoughLinesP(
+        work, 1, np.pi / 180.0, threshold=28,
+        minLineLength=max(14, min_len // 2), maxLineGap=max(8, min_len // 3),
     )
-    for i, (x1, y1, x2, y2) in enumerate(merged, start=1):
+    line_segments = (
+        [tuple(int(value) for value in segment) for segment in np.asarray(hough).reshape(-1, 4)]
+        if hough is not None else []
+    )
+    merged = _complete_junctions(
+        _merge_segments(band_segments + line_segments, min_len=max(14, min_len // 2)),
+        tolerance=max(6, min_len // 4),
+    )
+    for i, (x1, y1, x2, y2) in enumerate(merged, start=len(walls)):
         thick = _sample_thickness(dist, x1, y1, x2, y2)
         walls.append(
             Wall(
@@ -158,12 +156,59 @@ def walls_from_mask(mask: np.ndarray, min_area: int = 40) -> list[Wall]:
                 start=(float(x1), float(y1)),
                 end=(float(x2), float(y2)),
                 thickness_mm=float(max(thick * 2.0, 2.0)),
+                wall_type="thick_candidate" if thick * 2.0 >= 5.0 else "thin_candidate",
                 quad=[(float(x1), float(y1)), (float(x2), float(y2))],
             )
         )
-    if len(walls) == 1:
+    if not walls:
         walls.extend(_contour_walls(work, start_id=len(walls)))
     return walls
+
+
+def _trace_wall_bands(mask: np.ndarray, min_len: int) -> list[tuple[int, int, int, int]]:
+    segments: list[tuple[int, int, int, int]] = []
+    for horizontal in (True, False):
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (min_len, 3) if horizontal else (3, min_len)
+        )
+        bands = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        contours, _ = cv2.findContours(bands, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            span = width if horizontal else height
+            thickness = height if horizontal else width
+            if span < min_len or thickness > max(30, min_len):
+                continue
+            if horizontal:
+                cy = y + height // 2
+                segments.append((x, cy, x + width - 1, cy))
+            else:
+                cx = x + width // 2
+                segments.append((cx, y, cx, y + height - 1))
+    return _merge_segments(segments, min_len=min_len)
+
+
+def _complete_junctions(
+    segments: list[tuple[int, int, int, int]], tolerance: int
+) -> list[tuple[int, int, int, int]]:
+    """Close small wall gaps by snapping endpoints to traced perpendicular bands."""
+    mutable = [list(segment) for segment in segments]
+    horizontals = [item for item in mutable if item[1] == item[3]]
+    verticals = [item for item in mutable if item[0] == item[2]]
+    for horizontal in horizontals:
+        x0, y, x1, _ = horizontal
+        for vertical in verticals:
+            x, y0, _, y1 = vertical
+            if y0 - tolerance <= y <= y1 + tolerance and x0 - tolerance <= x <= x1 + tolerance:
+                if abs(x0 - x) <= tolerance:
+                    horizontal[0] = x
+                if abs(x1 - x) <= tolerance:
+                    horizontal[2] = x
+                if abs(y0 - y) <= tolerance:
+                    vertical[1] = y
+                if abs(y1 - y) <= tolerance:
+                    vertical[3] = y
+    return [tuple(item) for item in mutable]
 
 
 def _silhouette(mask: np.ndarray) -> np.ndarray:
@@ -347,3 +392,32 @@ def find_dimension_bars(rgb: np.ndarray) -> list[DimensionBar]:
     if vert:
         bars.append(max(vert, key=lambda b: b.length_px))
     return bars
+
+
+def trace_all_lines(rgb: np.ndarray) -> list[VectorTrace]:
+    """Vectorize every meaningful visible ink contour without semantic filtering."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    normalized = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    otsu = cv2.threshold(normalized, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    adaptive = cv2.adaptiveThreshold(
+        normalized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 11,
+    )
+    ink = cv2.bitwise_or(otsu, adaptive)
+    contours, _ = cv2.findContours(ink, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    traces: list[VectorTrace] = []
+    for contour in contours:
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter < 8:
+            continue
+        approx = cv2.approxPolyDP(contour, max(0.6, perimeter * 0.0015), True)
+        points = [(float(item[0][0]), float(item[0][1])) for item in approx]
+        if len(points) < 2:
+            continue
+        _, (box_width, box_height), _ = cv2.minAreaRect(contour)
+        stroke_band = min(box_width, box_height)
+        traces.append(VectorTrace(
+            id=f"trace_{len(traces)}", points=points,
+            closed=bool(len(points) >= 3), line_class="thick" if stroke_band >= 4 else "thin",
+        ))
+    return traces[:3000]

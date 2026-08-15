@@ -38,13 +38,11 @@ class GuidanceAudit:
 
 
 class QwenTopologyGuide:
-    """Use one Qwen vision specification, then validate reconstruction against it."""
+    """Use two vision passes around deterministic, pixel-validated reconstruction."""
 
     def __init__(self, api_key: str | None = None, model: str = "qwen/qwen3.6-27b",
-                 openrouter_api_key: str | None = None, enable_correction: bool = True,
-                 building_profile: dict | None = None):
+                 enable_correction: bool = True, building_profile: dict | None = None):
         self.api_key = api_key or os.environ.get("GROQ_API_KEY", "")
-        self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.model = model
         self.enable_correction = enable_correction
         self.building_profile = building_profile or {}
@@ -56,19 +54,28 @@ class QwenTopologyGuide:
     def __call__(self, rgb: np.ndarray, model: FloorplanModel) -> FloorplanModel:
         payload = review_against_spec(self.plan_spec, model)
         self._capture_review(payload, initial=True)
-        if self.audit.review_status != "needs_correction" or not self.enable_correction:
-            if self.audit.review_status == "needs_correction" and not self.enable_correction:
-                self.audit.correction_status = "disabled"
+        if not self.enable_correction:
+            self.audit.correction_status = "disabled"
             return model
         try:
-            planner = TopologyCorrectionPlanner(self.openrouter_api_key, self.api_key)
-            proposals = planner.propose(rgb, model, self.audit.discrepancies)
+            planner = TopologyCorrectionPlanner(self.api_key)
+            discrepancies = list(self.audit.discrepancies)
+            if not discrepancies:
+                discrepancies.append({
+                    "kind": "independent_visual_verification",
+                    "description": (
+                        "Independently verify the full topology and its closed exterior perimeter; "
+                        "return no operations when it already matches the image."
+                    ),
+                })
+            proposals = planner.propose(rgb, model, discrepancies)
             model = apply_corrections(rgb, model, proposals, self.audit.accepted, self.audit.rejected)
             self.audit.correction_model = planner.model_used
-            self.audit.correction_status = "applied" if any(
+            changed = any(
                 item.get("kind") in {"remove_wall", "replace_wall", "add_wall"}
                 for item in self.audit.accepted
-            ) else "no_valid_operations"
+            )
+            self.audit.correction_status = "applied" if changed else "verified_no_change"
             revised = review_against_spec(self.plan_spec, model)
             self._capture_review(revised, initial=False)
         except Exception as exc:
@@ -155,9 +162,16 @@ def review_against_spec(spec: dict, model: FloorplanModel) -> dict:
               if _bounded_confidence(item.get("confidence", 0)) >= 0.65]
     discrepancies = []
     matched = 0
+    exterior_matches = []
     for item in walls:
-        if any(_wall_matches(item, wall, tolerance) for wall in model.walls):
+        matching_wall = next(
+            (wall for wall in model.walls if _wall_matches(item, wall, tolerance)),
+            None,
+        )
+        if matching_wall is not None:
             matched += 1
+            if item.get("kind") == "external":
+                exterior_matches.append(matching_wall)
         else:
             discrepancies.append({"kind": "missing_specified_wall",
                                   "description": f"No pixel-supported reconstructed wall matches {item.get('start')} to {item.get('end')}.",
@@ -172,11 +186,63 @@ def review_against_spec(spec: dict, model: FloorplanModel) -> dict:
                                   "target": item})
     total = len(walls) + len(spaces)
     ratio = matched / total if total else 0.0
-    status = "approved" if total and ratio >= 0.70 else ("needs_correction" if total else "insufficient")
+    exterior_targets = [item for item in walls if item.get("kind") == "external"]
+    perimeter_closed = not exterior_targets or _closed_perimeter(
+        exterior_matches, tolerance
+    )
+    if exterior_targets and not perimeter_closed:
+        discrepancies.append({
+            "kind": "open_external_perimeter",
+            "description": "Exterior wall segments do not form one unbroken closed perimeter.",
+        })
+    status = (
+        "approved"
+        if total and ratio >= 0.70 and perimeter_closed
+        else ("needs_correction" if total else "insufficient")
+    )
     confidence = _bounded_confidence(spec.get("confidence", 0)) * (0.5 + 0.5 * ratio)
     return {"review": {"status": status, "confidence": confidence,
                        "summary": f"Matched {matched}/{total} high-confidence vision targets to pixel-derived topology.",
                        "discrepancies": discrepancies[:50]}}
+
+
+def _closed_perimeter(walls: list[Wall], tolerance: float) -> bool:
+    if len(walls) < 4:
+        return False
+    nodes: list[tuple[float, float]] = []
+    edges = []
+
+    def node_for(point):
+        for index, node in enumerate(nodes):
+            if np.hypot(point[0] - node[0], point[1] - node[1]) <= tolerance:
+                return index
+        nodes.append((float(point[0]), float(point[1])))
+        return len(nodes) - 1
+
+    for wall in walls:
+        a, b = node_for(wall.start), node_for(wall.end)
+        if a != b:
+            edges.append((a, b))
+    if len(edges) < 4:
+        return False
+    degrees = [0] * len(nodes)
+    adjacency = [set() for _ in nodes]
+    for a, b in edges:
+        degrees[a] += 1
+        degrees[b] += 1
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+    if any(degree != 2 for degree in degrees):
+        return False
+    visited = set()
+    stack = [0]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        stack.extend(adjacency[current] - visited)
+    return len(visited) == len(nodes)
 
 
 def _wall_matches(item: dict, wall: Wall, tolerance: float) -> bool:

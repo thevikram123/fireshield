@@ -816,21 +816,25 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
     }
 
     try {
-      // 1) CLIPSeg in-browser (progressive; may be unsupported).
-      if (widget.clip.supported) {
-        setState(() => _status = 'Segmenting equipment on-device (CLIPSeg)…');
-        for (final d in await widget.clip.detectBatch(_dataUrls)) {
+      // Qwen is the baseline. Optional CLIPSeg runs concurrently and is
+      // bounded, so model loading can never hold the audit spinner open.
+      setState(() => _status =
+          'Analysing evidence (vision model + optional on-device segmentation)…');
+      final clipFuture = widget.clip.supported
+          ? widget.clip
+              .detectBatch(_dataUrls)
+              .timeout(const Duration(seconds: 12), onTimeout: () => const [])
+          : Future.value(const <DetectedEquipment>[]);
+      final visionFuture = widget.svc.isConfigured
+          ? widget.svc.visionDetect(_dataUrls, evidenceContext: _context)
+          : Future.value(const <DetectedEquipment>[]);
+      final batches = await Future.wait([visionFuture, clipFuture]);
+      for (final batch in batches) {
+        for (final d in batch) {
           add(d);
         }
       }
-      // 2) Qwen vision via the Worker (baseline; reads type + condition).
-      if (widget.svc.isConfigured) {
-        setState(() => _status = 'Reading equipment detail (vision model)…');
-        for (final d in await widget.svc
-            .visionDetect(_dataUrls, evidenceContext: _context)) {
-          add(d);
-        }
-      } else if (merged.isEmpty) {
+      if (!widget.svc.isConfigured && merged.isEmpty) {
         throw const FsServiceException(
             'Vision service not configured — set FIRESHIELD_WORKER_URL.');
       }
@@ -966,14 +970,6 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
                   children: [
                     for (var i = 0; i < _dataUrls.length; i++) _thumb(i),
                   ],
-                ),
-              ],
-              if (!widget.clip.supported) ...[
-                const SizedBox(height: 10),
-                Text(
-                  'On-device CLIPSeg not available here — using the vision '
-                  'model only. (Still fully functional.)',
-                  style: FsText.tiny,
                 ),
               ],
               if (_busy) ...[

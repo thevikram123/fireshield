@@ -46,7 +46,9 @@ class FsClipsegService {
   Future<List<DetectedEquipment>> detect(String imageDataUrl) async {
     if (!supported) return const [];
     try {
-      final raw = await interop.detectEquipment(imageDataUrl, kClipsegPrompts);
+      final raw = await interop
+          .detectEquipment(imageDataUrl, kClipsegPrompts)
+          .timeout(const Duration(seconds: 12), onTimeout: () => const []);
       return raw
           .map((m) => DetectedEquipment.fromJson({...m, 'source': 'clipseg'}))
           .where((d) => d.count > 0)

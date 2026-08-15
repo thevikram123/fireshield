@@ -34,16 +34,17 @@ python -m floorplan2dxf convert samples\synthetic_plan.png --vision-first `
 ```
 
 `--vision-first` asks Qwen to specify rooms and structural walls before OpenCV
-reconstruction, then reviews the result. OpenRouter/Gemma is used only when the
-review reports a mismatch; GPT-OSS 120B is the text-only correction fallback.
-Use `--no-ai-correction` to inspect specification + review without spending the
-limited OpenRouter free-model quota.
+reconstruction. A mandatory second Qwen image pass independently verifies the
+traced topology, then GPT-OSS 120B turns that visual review into bounded
+correction proposals. Pixel support and closed-perimeter checks decide whether
+each proposal is accepted. `--no-ai-correction` disables the second pass for
+local diagnostics only.
 
 `--overall` is the printed size **on that drawing** (any units). Nothing in the engine is hardcoded to one plan. If OCR is installed, room sizes like `9'-0" x 12'-0"` are also used for scale.
 
 Outputs:
 
-- `out/plan.dxf` — layers `A-WALL`, `A-DOOR`, `A-GLAZ`, `A-ROOM`, `A-ANNO`, `A-FURN`
+- `out/plan.dxf` — semantic layers plus loss-preserving `A-TRACE-THIN` and `A-TRACE-THICK`
 - `out/plan.json` — `WALL` / `DOOR` / `ROOM` / `TEXT` objects for the later app
 - `out/plan_overlay.png` — debug overlay on the deskewed raster
 

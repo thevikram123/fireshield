@@ -75,17 +75,15 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
     final height = double.tryParse(_height.text.trim());
     final floorArea = double.tryParse(_floorArea.text.trim());
     final occupants = int.tryParse(_occupants.text.trim());
-    if (_building.text.trim().isEmpty ||
-        _level.text.trim().isEmpty ||
-        _occupancy == null ||
-        height == null ||
-        height <= 0 ||
-        floorArea == null ||
-        floorArea <= 0) {
-      setState(() => _error =
-          'Enter building, level, occupancy, building height and floor area.');
-      return;
-    }
+    final profile = <String, dynamic>{
+      if (_building.text.trim().isNotEmpty) 'building': _building.text.trim(),
+      if (_level.text.trim().isNotEmpty) 'level': _level.text.trim(),
+      if (_occupancy != null) 'occupancy': _occupancy,
+      if (height != null && height > 0) 'buildingHeightM': height,
+      if (floorArea != null && floorArea > 0) 'floorAreaM2': floorArea,
+      if (occupants != null && occupants > 0) 'expectedOccupants': occupants,
+      if (_notes.text.trim().isNotEmpty) 'notes': _notes.text.trim(),
+    };
     setState(() {
       _busy = true;
       _error = null;
@@ -98,16 +96,7 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
         filename: file.name,
         mimeType: _mime(file.extension),
         overall: _overall.text,
-        buildingProfile: {
-          'building': _building.text.trim(),
-          'level': _level.text.trim(),
-          'occupancy': _occupancy,
-          'buildingHeightM': height,
-          'floorAreaM2': floorArea,
-          if (occupants != null && occupants > 0)
-            'expectedOccupants': occupants,
-          if (_notes.text.trim().isNotEmpty) 'notes': _notes.text.trim(),
-        },
+        buildingProfile: profile,
       );
       if (!mounted) return;
       setState(() => _result = result);
@@ -115,16 +104,7 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
         file: file,
         result: result,
         latencyMs: DateTime.now().difference(started).inMilliseconds,
-        buildingProfile: {
-          'building': _building.text.trim(),
-          'level': _level.text.trim(),
-          'occupancy': _occupancy,
-          'buildingHeightM': height,
-          'floorAreaM2': floorArea,
-          if (occupants != null && occupants > 0)
-            'expectedOccupants': occupants,
-          if (_notes.text.trim().isNotEmpty) 'notes': _notes.text.trim(),
-        },
+        buildingProfile: profile,
       );
     } catch (error) {
       if (mounted) {
@@ -155,7 +135,9 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
       final assessmentId = await _persistence.createAssessment(
         organisationId: organisationId,
         kind: 'plan',
-        title: '${_building.text.trim()} · ${_level.text.trim()}',
+        title: buildingProfile['building']?.toString().isNotEmpty == true
+            ? '${buildingProfile['building']} · ${buildingProfile['level'] ?? 'Unspecified level'}'
+            : '${file.name} · ${buildingProfile['level'] ?? 'Unspecified level'}',
         buildingProfile: buildingProfile,
       );
       final sourceId = await _persistence.uploadArtifact(
@@ -257,20 +239,21 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
               TextField(
                 controller: _building,
                 decoration: const InputDecoration(
-                  labelText: 'Building / facility *',
+                  labelText: 'Building / facility (optional)',
                   hintText: 'Example: Phoenix Marketcity',
                 ),
               ),
               const SizedBox(height: 10),
               TextField(
                 controller: _level,
-                decoration: const InputDecoration(labelText: 'Floor / level *'),
+                decoration: const InputDecoration(
+                    labelText: 'Floor / level (optional)'),
               ),
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
                 initialValue: _occupancy,
-                decoration:
-                    const InputDecoration(labelText: 'NBC occupancy group *'),
+                decoration: const InputDecoration(
+                    labelText: 'NBC occupancy group (optional)'),
                 items: const [
                   'Residential',
                   'Educational',
@@ -300,7 +283,7 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
                       controller: _height,
                       keyboardType: TextInputType.number,
                       decoration: const InputDecoration(
-                        labelText: 'Building height (m) *',
+                        labelText: 'Building height (m, optional)',
                       ),
                     ),
                   ),
@@ -310,7 +293,9 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
                       controller: _floorArea,
                       keyboardType: TextInputType.number,
                       decoration: const InputDecoration(
-                        labelText: 'Floor area (m²) *',
+                        labelText: 'Floor area (m², optional)',
+                        helperText:
+                            'Calculated from scaled plan geometry when available',
                       ),
                     ),
                   ),
@@ -468,8 +453,8 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
     final basis = result.compliance['scoreBasis']?.toString() ??
         (score is num ? 'unspecified' : 'client_evidence_fallback');
     final confidence = result.compliance['scoreConfidence'];
-    final status = result.compliance['assessmentStatus']?.toString() ??
-        'provisional';
+    final status =
+        result.compliance['assessmentStatus']?.toString() ?? 'provisional';
     return FsCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

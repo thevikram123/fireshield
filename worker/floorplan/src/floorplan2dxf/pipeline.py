@@ -67,7 +67,8 @@ def convert(
     cv_geom = extract_geometry(prep.display_rgb, prep.wall_mask)
     if plan_spec:
         constraint = constrain_geometry_to_spec(
-            cv_geom, plan_spec, (prep.display_rgb.shape[1], prep.display_rgb.shape[0])
+            cv_geom, plan_spec, (prep.display_rgb.shape[1], prep.display_rgb.shape[0]),
+            rgb=prep.display_rgb,
         )
         if constraint.get("applied"):
             warnings.append(

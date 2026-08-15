@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from typing import Optional
 
 import numpy as np
@@ -11,14 +13,7 @@ from .schema import LABEL_TO_ROOM_TYPE, TextItem
 def run_ocr(rgb: np.ndarray, enabled: bool = True) -> list[TextItem]:
     if not enabled:
         return []
-    try:
-        import easyocr
-    except ImportError as exc:
-        raise RuntimeError(
-            "EasyOCR is not installed. Run: pip install -e \".[ocr]\"  or pass --no-ocr"
-        ) from exc
-
-    reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+    reader = _reader()
     items: list[TextItem] = []
     for box, text, conf in reader.readtext(rgb):
         content = (text or "").strip()
@@ -40,6 +35,18 @@ def run_ocr(rgb: np.ndarray, enabled: bool = True) -> list[TextItem]:
             )
         )
     return items
+
+
+@lru_cache(maxsize=1)
+def _reader():
+    import easyocr
+
+    return easyocr.Reader(
+        ["en"],
+        gpu=False,
+        verbose=False,
+        model_storage_directory=os.environ.get("EASYOCR_MODEL_DIR"),
+    )
 
 
 def label_to_room_type(text: str) -> Optional[str]:

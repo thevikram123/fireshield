@@ -18,6 +18,8 @@ LAYERS = {
     "A-CIRC": 6,
     "A-SAFE": 1,
     "A-BOUND": 5,
+    "A-TRACE-THIN": 9,
+    "A-TRACE-THICK": 8,
 }
 
 
@@ -46,6 +48,13 @@ def write_dxf(model: FloorplanModel, path: str | Path) -> Path:
         if door.quad:
             msp.add_lwpolyline(door.quad, close=True, dxfattribs={"layer": "A-DOOR"})
         _add_door_swing(msp, door)
+
+    for trace in model.traces:
+        if len(trace.points) >= 2:
+            msp.add_lwpolyline(
+                trace.points, close=trace.closed,
+                dxfattribs={"layer": "A-TRACE-THICK" if trace.line_class == "thick" else "A-TRACE-THIN"},
+            )
 
     for window in model.windows:
         if window.quad:

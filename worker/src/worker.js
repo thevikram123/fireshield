@@ -328,7 +328,8 @@ function compactPlanForReasoning(converted) {
       occupancy: String(converted?.buildingProfile?.occupancy || '').slice(0, 100),
       buildingHeightM: Number(converted?.buildingProfile?.buildingHeightM) || null,
       floors: Number(converted?.buildingProfile?.floors) || null,
-      floorAreaM2: Number(converted?.buildingProfile?.floorAreaM2) || null,
+      floorAreaM2: Number(converted?.buildingProfile?.floorAreaM2
+        || converted?.commercialModel?.building?.floorAreaM2) || null,
       sprinklered: converted?.buildingProfile?.sprinklered === true,
     },
     qwenReview: {

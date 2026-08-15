@@ -33,8 +33,9 @@
       const hasGpu = typeof navigator !== 'undefined' && 'gpu' in navigator;
       const mem = (navigator && navigator.deviceMemory) || 4;
       const hasWasm = typeof WebAssembly === 'object';
-      // Small model — WASM is fine, but skip clearly low-memory phones.
-      return hasWasm && (hasGpu || mem >= 4);
+      // CPU/WASM inference can take minutes and lock the UI. Only advertise
+      // the enhancement when WebGPU is present; Qwen remains the baseline.
+      return hasWasm && hasGpu && mem >= 4;
     } catch (_) {
       return false;
     }
@@ -52,7 +53,7 @@
       }
       const processor = await AutoProcessor.from_pretrained(MODEL_ID);
       const model = await CLIPSegForImageSegmentation.from_pretrained(MODEL_ID, {
-        dtype: 'fp32',
+        dtype: 'fp16',
       });
       _pipe = { processor, model, RawImage, sigmoid: t.sigmoid };
       return _pipe;

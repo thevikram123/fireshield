@@ -64,6 +64,7 @@ def reconstruct(
         model.walls = _renumber_walls(cv_walls)
     else:
         model.walls = _snap_walls(walls)
+    model.traces = list(getattr(cv_geom, "traces", None) or [])
 
     door_i = 0
     win_i = 0
@@ -207,6 +208,8 @@ def apply_scale(model: FloorplanModel, mm_per_px: Optional[float]) -> FloorplanM
         furn.quad = [pt(p) for p in furn.quad]
     for obj in model.objects:
         obj.boundary = [pt(p) for p in obj.boundary]
+    for trace in model.traces:
+        trace.points = [pt(point) for point in trace.points]
     model.exterior_boundary = [pt(p) for p in model.exterior_boundary]
     model.units = "mm"
     return model

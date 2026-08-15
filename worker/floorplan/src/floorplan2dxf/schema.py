@@ -84,7 +84,7 @@ class Wall:
     end: Point
     thickness_mm: float
     kind: Literal["wall", "railing"] = "wall"
-    wall_type: Literal["external", "internal", "unknown"] = "unknown"
+    wall_type: Literal["external", "internal", "unknown", "thin_candidate", "thick_candidate"] = "unknown"
     quad: list[Point] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -158,6 +158,17 @@ class ArchitecturalObject:
 
 
 @dataclass
+class VectorTrace:
+    id: str
+    points: list[Point]
+    closed: bool = False
+    line_class: Literal["thin", "thick"] = "thin"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class RoomConnection:
     id: str
     from_room_id: str
@@ -191,6 +202,7 @@ class FloorplanModel:
     texts: list[TextItem] = field(default_factory=list)
     furniture: list[Furniture] = field(default_factory=list)
     objects: list[ArchitecturalObject] = field(default_factory=list)
+    traces: list[VectorTrace] = field(default_factory=list)
     connections: list[RoomConnection] = field(default_factory=list)
     exterior_boundary: list[Point] = field(default_factory=list)
     level_id: str = "level_0"
@@ -210,6 +222,7 @@ class FloorplanModel:
             "texts": [t.to_dict() for t in self.texts],
             "furniture": [f.to_dict() for f in self.furniture],
             "objects": [o.to_dict() for o in self.objects],
+            "traces": [trace.to_dict() for trace in self.traces],
             "exterior_boundary": self.exterior_boundary,
             "room_graph": {
                 "outside_node": "outside",

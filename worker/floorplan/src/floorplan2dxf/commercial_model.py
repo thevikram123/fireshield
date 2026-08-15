@@ -18,6 +18,11 @@ def build_commercial_model(model: FloorplanModel, building_profile: dict | None 
     audit = guidance_audit or {}
     elements = [_spec_element(item, model) for item in list(spec.get("elements") or [])[:200]]
     elements = [item for item in elements if item is not None]
+    measured_area = sum(room.area_m2 or 0 for room in model.rooms)
+    supplied_area = profile.get("floorAreaM2")
+    floor_area = supplied_area if supplied_area else (
+        round(measured_area, 2) if measured_area > 0 else None
+    )
 
     def kinds(*names):
         return [item for item in elements if item["kind"] in names]
@@ -27,7 +32,11 @@ def build_commercial_model(model: FloorplanModel, building_profile: dict | None 
         "building": {
             "name": profile.get("building"), "occupancy": profile.get("occupancy"),
             "floors": profile.get("floors"), "buildingHeightM": profile.get("buildingHeightM"),
-            "floorAreaM2": profile.get("floorAreaM2"), "units": model.units,
+            "floorAreaM2": floor_area,
+            "floorAreaSource": "user_provided" if supplied_area else (
+                "scaled_geometry" if floor_area is not None else "unavailable"
+            ),
+            "units": model.units,
         },
         "floor": {
             "id": str(profile.get("level") or model.level_id),

@@ -46,7 +46,7 @@ def test_vision_spec_suppresses_unmatched_hough_lines_and_matches_rooms():
     }, (100, 100))
 
     assert audit["applied"] is True
-    assert [wall.id for wall in geometry.walls] == ["outline", "divider"]
+    assert [wall.id for wall in geometry.walls] == ["divider"]
     assert [(room.label, room.type) for room in geometry.rooms] == [
         ("Bedroom", "BEDROOM"), ("Kitchen", "KITCHEN"),
     ]
@@ -71,3 +71,30 @@ def test_single_vision_spec_approves_matching_python_topology_and_flags_mismatch
     mismatch = review_against_spec(spec, model)["review"]
     assert mismatch["status"] == "needs_correction"
     assert len(mismatch["discrepancies"]) == 2
+
+
+def test_external_walls_must_form_one_closed_perimeter():
+    model = FloorplanModel(
+        image_size=(100, 100),
+        walls=[
+            Wall("top", (10, 10), (90, 10), 5),
+            Wall("right", (90, 10), (90, 90), 5),
+            Wall("bottom", (90, 90), (10, 90), 5),
+        ],
+    )
+    spec = {
+        "status": "usable", "confidence": 0.95,
+        "major_walls": [
+            {"start": [10, 10], "end": [90, 10], "kind": "external", "confidence": 0.95},
+            {"start": [90, 10], "end": [90, 90], "kind": "external", "confidence": 0.95},
+            {"start": [90, 90], "end": [10, 90], "kind": "external", "confidence": 0.95},
+            {"start": [10, 90], "end": [10, 10], "kind": "external", "confidence": 0.95},
+        ],
+    }
+    open_review = review_against_spec(spec, model)["review"]
+    assert open_review["status"] == "needs_correction"
+    assert any(item["kind"] == "open_external_perimeter"
+               for item in open_review["discrepancies"])
+
+    model.walls.append(Wall("left", (10, 90), (10, 10), 5))
+    assert review_against_spec(spec, model)["review"]["status"] == "approved"

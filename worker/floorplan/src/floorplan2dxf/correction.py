@@ -13,11 +13,11 @@ import numpy as np
 from .schema import FloorplanModel, Wall
 
 
-OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
-GROQ_FALLBACK_MODEL = "openai/gpt-oss-120b"
+QWEN_VISION_MODEL = "qwen/qwen3.6-27b"
+GROQ_REASONING_MODEL = "openai/gpt-oss-120b"
 
 
-def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, int]) -> dict:
+def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, int], rgb=None) -> dict:
     """Match deterministic candidates to a high-confidence vision specification."""
     if (str(plan_spec.get("status")) != "usable"
             or _confidence(plan_spec) < 0.7):
@@ -28,9 +28,9 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
     predicted = [item for item in list(plan_spec.get("major_walls") or [])[:32]
                  if _confidence(item) >= 0.65]
     candidates = list(cv_geom.walls)
-    outline = [wall for wall in candidates if len(wall.quad) >= 3][:1]
-    line_candidates = [wall for wall in candidates if wall not in outline]
+    line_candidates = candidates
     matched: list[Wall] = []
+    external_points = []
 
     for target in predicted:
         start, end = _axis_segment(target.get("start"), target.get("end"), image_size)
@@ -46,18 +46,37 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
             wx, wy = (wall.start[0] + wall.end[0]) / 2, (wall.start[1] + wall.end[1]) / 2
             perpendicular = abs(wy - ty) if target_horizontal else abs(wx - tx)
             along = abs(wx - tx) if target_horizontal else abs(wy - ty)
-            score = perpendicular / scale + 0.25 * along / scale
+            target_span = (start[0], end[0]) if target_horizontal else (start[1], end[1])
+            wall_span = (wall.start[0], wall.end[0]) if target_horizontal else (wall.start[1], wall.end[1])
+            overlap = _span_overlap(target_span, wall_span)
+            if overlap < 0.30:
+                continue
+            score = perpendicular / scale + 0.15 * along / scale + 0.05 * (1 - overlap)
             if score < best_score:
                 best, best_score = wall, score
-        if best is not None and best_score <= 0.12 and best not in matched:
-            best.wall_type = str(target.get("kind", "unknown")) if target.get("kind") in {
+        support = _wall_support(rgb, start, end, best.thickness_mm if best else 8) if rgb is not None else 1.0
+        if best is not None and best_score <= 0.075 and support >= 0.18:
+            wall_type = str(target.get("kind", "unknown")) if target.get("kind") in {
                 "external", "internal"
             } else "unknown"
-            matched.append(best)
+            snapped = Wall(
+                id=best.id, start=start, end=end,
+                thickness_mm=best.thickness_mm, wall_type=wall_type,
+            )
+            if not any(_same_segment(snapped.start, snapped.end, item.start, item.end, 5)
+                       for item in matched):
+                matched.append(snapped)
+                if wall_type == "external":
+                    external_points.extend((start, end))
 
     # A usable vision spec is allowed to suppress unmatched Hough lines, which
     # are commonly furniture, text underlines or dimension strokes.
-    cv_geom.walls = outline + matched
+    _snap_external_junctions(matched, tolerance=max(4.0, scale * 0.025))
+    cv_geom.walls = matched
+    if len(external_points) >= 4:
+        xs = [point[0] for point in external_points]
+        ys = [point[1] for point in external_points]
+        cv_geom.envelope = (min(xs), min(ys), max(xs), max(ys))
 
     expected_rooms = [item for item in list(plan_spec.get("spaces") or plan_spec.get("rooms") or [])[:80]
                       if _confidence(item) >= 0.6]
@@ -82,6 +101,14 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
             room = cv_geom.rooms[best_i]
             room.label = str(target.get("label", ""))[:80] or None
             room.type = str(target.get("type", "UNDEFINED"))[:40].upper()
+            bbox = target.get("bbox")
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                try:
+                    x0, y0, x1, y1 = map(float, bbox)
+                    if 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height:
+                        room.boundary = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                except (TypeError, ValueError):
+                    pass
             selected_rooms.append(room)
             used.add(best_i)
     if selected_rooms:
@@ -96,64 +123,93 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
     }
 
 
+def _snap_external_junctions(walls: list[Wall], tolerance: float) -> None:
+    """Make verified exterior endpoints share exact coordinates at nearby junctions."""
+    endpoints = []
+    for wall in walls:
+        if wall.wall_type == "external":
+            endpoints.extend(((wall, "start", wall.start), (wall, "end", wall.end)))
+    unused = set(range(len(endpoints)))
+    while unused:
+        seed = unused.pop()
+        cluster = {seed}
+        changed = True
+        while changed:
+            changed = False
+            for index in list(unused):
+                point = endpoints[index][2]
+                if any(np.hypot(point[0] - endpoints[item][2][0], point[1] - endpoints[item][2][1]) <= tolerance
+                       for item in cluster):
+                    unused.remove(index)
+                    cluster.add(index)
+                    changed = True
+        if len(cluster) < 2:
+            continue
+        x = float(np.mean([endpoints[index][2][0] for index in cluster]))
+        y = float(np.mean([endpoints[index][2][1] for index in cluster]))
+        for index in cluster:
+            wall, attribute, _ = endpoints[index]
+            setattr(wall, attribute, (x, y))
+
+
+def _span_overlap(a, b) -> float:
+    a0, a1 = sorted(map(float, a))
+    b0, b1 = sorted(map(float, b))
+    intersection = max(0.0, min(a1, b1) - max(a0, b0))
+    return intersection / max(a1 - a0, 1.0)
+
+
 class TopologyCorrectionPlanner:
-    def __init__(self, openrouter_key: str, groq_key: str):
-        self.openrouter_key = openrouter_key
+    def __init__(self, groq_key: str):
         self.groq_key = groq_key
         self.model_used = ""
 
     def propose(self, rgb: np.ndarray, model: FloorplanModel, discrepancies: list[dict]) -> dict:
         prompt = _correction_prompt(model, discrepancies)
-        if self.openrouter_key:
-            try:
-                result = self._openrouter(rgb, prompt)
-                self.model_used = str(result.get("model") or OPENROUTER_MODEL)
-                return _message_json(result)
-            except (RuntimeError, urllib.error.URLError, json.JSONDecodeError):
-                pass
         if not self.groq_key:
             raise RuntimeError("no correction model is configured")
-        result = self._groq(prompt)
-        self.model_used = GROQ_FALLBACK_MODEL
+        visual_result = self._qwen_visual(rgb, prompt)
+        visual_review = _message_json(visual_result)
+        result = self._groq(prompt, visual_review)
+        self.model_used = f"{QWEN_VISION_MODEL} + {GROQ_REASONING_MODEL}"
         return _message_json(result)
 
-    def _openrouter(self, rgb: np.ndarray, prompt: str) -> dict:
+    def _qwen_visual(self, rgb: np.ndarray, prompt: str) -> dict:
         ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
                                    [cv2.IMWRITE_JPEG_QUALITY, 88])
         if not ok:
             raise RuntimeError("could not encode correction image")
         image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
         return _post_json(
-            "https://openrouter.ai/api/v1/chat/completions",
-            self.openrouter_key,
+            "https://api.groq.com/openai/v1/chat/completions",
+            self.groq_key,
             {
-                "model": OPENROUTER_MODEL,
+                "model": QWEN_VISION_MODEL,
                 "messages": [{"role": "user", "content": [
                     {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": image_url}},
                 ]}],
-                "temperature": 0.1,
-                "max_tokens": 1600,
+                "temperature": 0.2,
+                "max_completion_tokens": 1200,
+                "reasoning_effort": "none",
                 "response_format": {"type": "json_object"},
                 "stream": False,
             },
-            extra_headers={
-                "HTTP-Referer": "https://thevikram123.github.io/fireshield/",
-                "X-OpenRouter-Title": "FireShield AI",
-            },
         )
 
-    def _groq(self, prompt: str) -> dict:
+    def _groq(self, prompt: str, visual_review: dict) -> dict:
         text_prompt = (
-            "You cannot see the source image. Use only Qwen's visual discrepancies and the supplied topology "
-            "to propose conservative candidate operations; Python will reject anything unsupported by pixels. "
-            + prompt
+            "Use the second Qwen visual verifier result below to produce the final conservative correction "
+            "operations. Preserve its coordinates, remove unsupported speculation, and ensure the proposed "
+            "external walls can form one closed perimeter. Python will reject any operation unsupported by "
+            "pixels. Return only the same JSON operation schema requested in the task.\nTASK:\n"
+            + prompt + "\nSECOND_VISUAL_REVIEW:\n" + json.dumps(visual_review)
         )
         return _post_json(
             "https://api.groq.com/openai/v1/chat/completions",
             self.groq_key,
             {
-                "model": GROQ_FALLBACK_MODEL,
+                "model": GROQ_REASONING_MODEL,
                 "messages": [{"role": "user", "content": text_prompt}],
                 "temperature": 0.1,
                 "max_completion_tokens": 1200,
@@ -242,8 +298,12 @@ def _correction_prompt(model: FloorplanModel, discrepancies: list[dict]) -> str:
                   for door in model.doors[:100]],
     }
     return (
-        "Correct the extracted floor-plan topology using the source image and Qwen review. Coordinates are "
-        "pixels. Propose only high-confidence axis-aligned wall operations. Do not emit DXF. Return JSON only: "
+        "Act as the second, independent visual verifier for this floor-plan reconstruction. Inspect the source "
+        "image itself, then compare it with both the extracted topology and Qwen's first-pass review. Verify "
+        "that exterior walls form one unbroken closed perimeter and that structural walls are not confused "
+        "with furniture, text, dimensions, hatching, or door-swing arcs. Correct any clear mismatch. Coordinates "
+        "are pixels. Propose only high-confidence axis-aligned wall operations; return empty operation arrays "
+        "when the reconstruction is already correct. Do not emit DXF. Return JSON only: "
         '{"summary":string,"remove_walls":[{"wall_id":string,"confidence":0..1,"reason":string}],'
         '"replace_walls":[{"wall_id":string,"start":[x,y],"end":[x,y],"thickness":number,'
         '"confidence":0..1,"reason":string}],"add_walls":[{"start":[x,y],"end":[x,y],'
@@ -318,4 +378,3 @@ def _same_segment(a, b, c, d, tolerance: float) -> bool:
     direct = np.hypot(a[0] - c[0], a[1] - c[1]) + np.hypot(b[0] - d[0], b[1] - d[1])
     reverse = np.hypot(a[0] - d[0], a[1] - d[1]) + np.hypot(b[0] - c[0], b[1] - c[1])
     return min(direct, reverse) <= tolerance * 2
-
