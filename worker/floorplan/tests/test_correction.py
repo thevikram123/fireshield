@@ -25,7 +25,7 @@ def test_pixel_gate_removes_unsupported_wall_and_adds_supported_wall():
     assert {item["kind"] for item in accepted} == {"remove_wall", "add_wall"}
 
 
-def test_vision_spec_suppresses_unmatched_hough_lines_and_matches_rooms():
+def test_vision_spec_labels_walls_without_discarding_traced_geometry():
     outline = Wall("outline", (0, 0), (99, 0), 8, quad=[(0, 0), (99, 0), (99, 99), (0, 99)])
     divider = Wall("divider", (50, 0), (50, 99), 5)
     furniture_line = Wall("noise", (10, 25), (40, 25), 3)
@@ -46,7 +46,13 @@ def test_vision_spec_suppresses_unmatched_hough_lines_and_matches_rooms():
     }, (100, 100))
 
     assert audit["applied"] is True
-    assert [wall.id for wall in geometry.walls] == ["divider"]
+    # Non-destructive: every traced wall is preserved, never suppressed by an
+    # unmatched vision spec (that collapse was the deployed floor-plan bug).
+    assert {wall.id for wall in geometry.walls} == {"outline", "divider", "noise"}
+    assert audit["matchedWalls"] == 1
+    # The matched wall is only labeled, not moved or replaced.
+    assert next(w for w in geometry.walls if w.id == "divider").wall_type == "internal"
+    # Deterministic rooms are relabeled in place, not dropped.
     assert [(room.label, room.type) for room in geometry.rooms] == [
         ("Bedroom", "BEDROOM"), ("Kitchen", "KITCHEN"),
     ]

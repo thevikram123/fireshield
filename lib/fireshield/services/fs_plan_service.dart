@@ -15,6 +15,7 @@ class FsPlanResult {
   final Map<String, dynamic> topology;
   final Map<String, dynamic> commercialModel;
   final Map<String, dynamic> guidance;
+  final Map<String, dynamic> visionAdvisory;
   final Map<String, dynamic> metrics;
   final Map<String, dynamic> artifacts;
   final Map<String, dynamic> compliance;
@@ -24,6 +25,7 @@ class FsPlanResult {
     required this.topology,
     required this.commercialModel,
     required this.guidance,
+    required this.visionAdvisory,
     required this.metrics,
     required this.artifacts,
     required this.compliance,
@@ -35,6 +37,8 @@ class FsPlanResult {
         commercialModel:
             Map<String, dynamic>.from(json['commercialModel'] as Map? ?? {}),
         guidance: Map<String, dynamic>.from(json['guidance'] as Map? ?? {}),
+        visionAdvisory:
+            Map<String, dynamic>.from(json['visionAdvisory'] as Map? ?? {}),
         metrics: Map<String, dynamic>.from(json['metrics'] as Map? ?? {}),
         artifacts: Map<String, dynamic>.from(json['artifacts'] as Map? ?? {}),
         compliance: Map<String, dynamic>.from(json['compliance'] as Map? ?? {}),

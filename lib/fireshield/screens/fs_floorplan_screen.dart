@@ -401,23 +401,33 @@ class _FsFloorplanScreenState extends State<FsFloorplanScreen> {
   }
 
   Widget _review(FsPlanResult result) {
-    final status = result.guidance['reviewStatus']?.toString() ?? 'unknown';
+    // Qwen is a separate advisory stream — it enriches context but never gates
+    // the deterministic geometry. Fall back to legacy `guidance` if present.
+    final advisory = result.visionAdvisory.isNotEmpty
+        ? result.visionAdvisory
+        : result.guidance;
+    final status = (advisory['status'] ?? advisory['reviewStatus'] ?? 'not run')
+        .toString();
     final confidence =
-        ((result.guidance['reviewConfidence'] as num?) ?? 0).toDouble();
-    final discrepancies = result.guidance['discrepancies'] as List? ?? const [];
+        ((advisory['confidence'] ?? advisory['reviewConfidence']) as num? ?? 0)
+            .toDouble();
+    final summary =
+        (advisory['summary'] ?? advisory['reviewSummary'] ?? '').toString();
+    final spaces = advisory['spaces'] as List? ?? const [];
     return FsCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Qwen visual review: ${status.replaceAll('_', ' ')}',
+          Text('Qwen visual read (advisory): ${status.replaceAll('_', ' ')}',
               style: FsText.cardTitle),
-          Text('${(confidence * 100).round()}% review confidence',
+          Text(
+              'Separate visual stream — does not alter the traced geometry. '
+              '${(confidence * 100).round()}% confidence',
               style: FsText.tiny),
-          if ((result.guidance['reviewSummary']?.toString() ?? '').isNotEmpty)
-            Text(result.guidance['reviewSummary'].toString(),
-                style: FsText.small),
-          for (final item in discrepancies.take(6))
-            Text('• ${item is Map ? item['description'] ?? item : item}',
+          if (summary.isNotEmpty) Text(summary, style: FsText.small),
+          for (final item in spaces.take(8))
+            Text(
+                '• ${item is Map ? (item['label'] ?? item['type'] ?? item) : item}',
                 style: FsText.tiny),
           for (final warning in result.warnings)
             Text('Warning: $warning',

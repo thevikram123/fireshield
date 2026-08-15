@@ -66,14 +66,16 @@ test('floorplan conversion calls protected Qwen service then GPT-OSS NBCS assess
       return Response.json({
         buildingProfile: { occupancy: 'Business', buildingHeightM: 12 },
         topology: {
-          units: 'mm',
+          units: 'mm', mm_per_px: 10,
+          walls: [{ id: 'w0', start: [0, 0], end: [100, 0] }],
           rooms: Array.from({ length: 100 }, (_, i) => ({
             id: `room-${i}`, type: 'OFFICE', label: `Office ${i}`,
             boundary: Array.from({ length: 100 }, (_, p) => [p, p + i]),
           })),
           room_graph: { nodes: [], edges: [] },
         },
-        guidance: { reviewStatus: 'approved' }, metrics: { rooms: 0 }, artifacts: {},
+        visionAdvisory: { status: 'usable', confidence: 0.8, summary: 'Office floor with a fire stair.' },
+        metrics: { walls: 1, rooms: 100 }, artifacts: {},
         oversizedArtifactMustNotReachGroq: 'x'.repeat(100_000),
       });
     }
@@ -118,33 +120,31 @@ test('floorplan conversion calls protected Qwen service then GPT-OSS NBCS assess
   assert.equal(groqPayload.reasoning_effort, 'low');
 });
 
-test('unapproved geometry produces image-semantic context instead of trusted measurements', async (t) => {
+test('a non-approving Qwen advisory never strips the deterministic geometry', async (t) => {
   let groqPayload;
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     if (String(url) === 'https://floorplan.test/convert') {
       return Response.json({
         buildingProfile: { occupancy: 'Business' },
-        guidance: {
-          reviewStatus: 'needs_correction', specificationStatus: 'usable',
-          specificationConfidence: 0.91, specificationSummary: 'Commercial office and fire stair visible.',
+        // Separate Qwen advisory stream that did NOT approve — must not gate geometry.
+        visionAdvisory: {
+          status: 'insufficient', confidence: 0.91,
+          summary: 'Commercial office and fire stair visible.',
+          spaces: [{ label: 'Office', type: 'OFFICE' }],
         },
         topology: {
           units: 'mm', mm_per_px: 10,
-          rooms: [{ id: 'bad-room', type: 'OFFICE', boundary: [[987654, 987654]] }],
+          walls: [{ id: 'w0', start: [0, 0], end: [500, 0] }],
+          rooms: [{ id: 'office', type: 'OFFICE', boundary: [[0, 0], [50, 0], [50, 50], [0, 50]] }],
           room_graph: { nodes: [], edges: [] },
         },
-        commercialModel: { floor: {
-          spaces: [{ id: 'S1', name: 'Office', type: 'OFFICE', evidence: { status: 'measured' } }],
-          circulation: { stairs: [{ id: 'ST1', evidence: { status: 'candidate' } }] },
-          fireLifeSafety: { equipment: [] },
-        } },
-        metrics: { rooms: 1 }, artifacts: {},
+        metrics: { walls: 1, rooms: 1 }, artifacts: {},
       });
     }
     groqPayload = JSON.parse(options.body);
     return Response.json({ choices: [{ message: { content: JSON.stringify({
-      planSummary: 'Image-only assessment.', score: null, findings: [], citedClauses: [],
-      limitations: ['Geometry not verified'],
+      planSummary: 'Geometry-based assessment.', score: null, findings: [], citedClauses: [],
+      limitations: [],
     }) } }] });
   });
   const form = new FormData();
@@ -154,15 +154,15 @@ test('unapproved geometry produces image-semantic context instead of trusted mea
   }), env());
   assert.equal(response.status, 200);
   const context = JSON.parse(groqPayload.messages[1].content);
-  assert.equal(context.plan.assessmentMode, 'image_semantic');
-  assert.equal(context.plan.mmPerPx, null);
-  assert.deepEqual(context.plan.rooms, []);
-  assert.doesNotMatch(groqPayload.messages[1].content, /987654/);
-  assert.equal(context.plan.imageSemanticEvidence.visibleSpaces[0].name, 'Office');
+  // Deterministic geometry is fed to GPT-OSS regardless of the Qwen verdict.
+  assert.equal(context.plan.assessmentMode, 'verified_geometry');
+  assert.equal(context.plan.mmPerPx, 10);
+  assert.equal(context.plan.rooms.length, 1);
+  // Qwen rides along as a separate advisory input, not a gate.
+  assert.equal(context.plan.visionAdvisory.status, 'insufficient');
+  assert.equal(context.plan.visionAdvisory.spaces[0].label, 'Office');
   const body = await response.clone().json();
-  assert.equal(body.compliance.score, 50);
-  assert.equal(body.compliance.scoreBasis, 'image_semantic');
-  assert.equal(body.compliance.assessmentStatus, 'provisional');
+  assert.equal(body.compliance.scoreBasis, 'verified_geometry');
 });
 
 test('chat fails closed when the reasoning limiter is missing', async () => {

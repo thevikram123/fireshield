@@ -241,11 +241,13 @@ function finalisePlanAssessment(value, plan) {
   const score = Number.isFinite(supplied) ? supplied : calculated;
   const evidenceFraction = findings.length ? verifiable / findings.length : 0;
   const geometryVerified = plan.assessmentMode === 'verified_geometry';
-  const reviewConfidence = Number(plan.qwenReview?.reviewConfidence) || 0;
-  const specificationConfidence = Number(plan.imageSemanticEvidence?.specificationConfidence) || 0;
-  const confidence = geometryVerified
-    ? 0.55 + 0.25 * evidenceFraction + 0.20 * reviewConfidence
-    : 0.15 + 0.35 * evidenceFraction + 0.30 * specificationConfidence;
+  const hasGeometry = plan.assessmentMode !== 'image_semantic';
+  const advisoryConfidence = Number(plan.visionAdvisory?.confidence) || 0;
+  // Geometry (scaled or unscaled) is the primary evidence; the Qwen advisory
+  // stream only nudges confidence, it is never the sole basis when a DXF exists.
+  const confidence = hasGeometry
+    ? 0.45 + 0.25 * evidenceFraction + (geometryVerified ? 0.15 : 0) + 0.10 * advisoryConfidence
+    : 0.15 + 0.35 * evidenceFraction + 0.30 * advisoryConfidence;
   return {
     ...value,
     assessmentStatus: geometryVerified && evidenceFraction >= 0.5 ? 'complete' : 'provisional',
@@ -318,12 +320,25 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
 
 function compactPlanForReasoning(converted) {
   const topology = converted?.topology || {};
-  const guidance = converted?.guidance || {};
-  const geometryApproved = guidance.reviewStatus === 'approved';
-  const commercialFloor = converted?.commercialModel?.floor || {};
+  const advisory = converted?.visionAdvisory || {};
+  const metrics = converted?.metrics || {};
   const point = (value) => Array.isArray(value) ? value.slice(0, 2).map(Number) : value;
+
+  // The deterministic DXF is the geometry authority and is ALWAYS reasoned over.
+  // Whether printed scale was recovered decides only if absolute NBC dimensions
+  // (widths, travel distances in metres) can be checked — never whether geometry
+  // is included at all. Qwen never gates this.
+  const wallCount = Number(metrics.walls)
+    || (Array.isArray(topology.walls) ? topology.walls.length : 0);
+  const mmPerPx = Number(topology.mm_per_px);
+  const hasScale = Number.isFinite(mmPerPx) && mmPerPx > 0;
+  const hasGeometry = wallCount > 0;
+  const assessmentMode = hasGeometry
+    ? (hasScale ? 'verified_geometry' : 'geometry_unscaled')
+    : 'image_semantic';
+
   return {
-    assessmentMode: geometryApproved ? 'verified_geometry' : 'image_semantic',
+    assessmentMode,
     buildingProfile: {
       occupancy: String(converted?.buildingProfile?.occupancy || '').slice(0, 100),
       buildingHeightM: Number(converted?.buildingProfile?.buildingHeightM) || null,
@@ -332,54 +347,46 @@ function compactPlanForReasoning(converted) {
         || converted?.commercialModel?.building?.floorAreaM2) || null,
       sprinklered: converted?.buildingProfile?.sprinklered === true,
     },
-    qwenReview: {
-      reviewStatus: converted?.guidance?.reviewStatus,
-      reviewConfidence: converted?.guidance?.reviewConfidence,
-      reviewSummary: String(converted?.guidance?.reviewSummary || '').slice(0, 500),
-      discrepancies: Array.isArray(converted?.guidance?.discrepancies)
-        ? converted.guidance.discrepancies.slice(0, 10) : [],
+    // Separate Qwen advisory stream: semantic observations that enrich the
+    // reasoning context. It is INPUT, not a filter — it cannot remove geometry.
+    visionAdvisory: {
+      status: String(advisory.status || 'not_run'),
+      confidence: Number(advisory.confidence) || 0,
+      summary: String(advisory.summary || '').slice(0, 500),
+      spaces: Array.isArray(advisory.spaces) ? advisory.spaces.slice(0, 80) : [],
+      openings: Array.isArray(advisory.openings) ? advisory.openings.slice(0, 80) : [],
+      elements: Array.isArray(advisory.elements) ? advisory.elements.slice(0, 80) : [],
     },
-    metrics: { ...(converted?.metrics || {}), geometryVerified: geometryApproved },
-    units: geometryApproved ? topology.units : 'unverified',
-    mmPerPx: geometryApproved ? topology.mm_per_px : null,
+    metrics: { ...metrics, geometryVerified: hasScale && hasGeometry },
+    units: topology.units,
+    mmPerPx: hasScale ? mmPerPx : null,
     imageSize: topology.image_size,
-    exteriorBoundary: geometryApproved && Array.isArray(topology.exterior_boundary)
+    exteriorBoundary: Array.isArray(topology.exterior_boundary)
       ? topology.exterior_boundary.slice(0, 60).map(point) : [],
-    rooms: geometryApproved && Array.isArray(topology.rooms) ? topology.rooms.slice(0, 50).map((room) => ({
+    rooms: Array.isArray(topology.rooms) ? topology.rooms.slice(0, 50).map((room) => ({
       id: room.id, type: room.type, label: room.label,
       area_mm2: room.area_mm2,
       boundary: Array.isArray(room.boundary) ? room.boundary.slice(0, 24).map(point) : [],
     })) : [],
-    doors: geometryApproved && Array.isArray(topology.doors) ? topology.doors.slice(0, 80).map((door) => ({
+    doors: Array.isArray(topology.doors) ? topology.doors.slice(0, 80).map((door) => ({
       id: door.id, wall_id: door.wall_id, width_mm: door.width_mm, center: point(door.center),
     })) : [],
-    windows: geometryApproved && Array.isArray(topology.windows) ? topology.windows.slice(0, 80).map((window) => ({
+    windows: Array.isArray(topology.windows) ? topology.windows.slice(0, 80).map((window) => ({
       id: window.id, wall_id: window.wall_id, width_mm: window.width_mm, center: point(window.center),
     })) : [],
-    objects: geometryApproved && Array.isArray(topology.objects) ? topology.objects.slice(0, 80).map((object) => ({
+    objects: Array.isArray(topology.objects) ? topology.objects.slice(0, 80).map((object) => ({
       id: object.id, type: object.type, center: point(object.center), confidence: object.confidence,
     })) : [],
     roomGraph: {
-      nodes: geometryApproved && Array.isArray(topology.room_graph?.nodes) ? topology.room_graph.nodes.slice(0, 80)
+      nodes: Array.isArray(topology.room_graph?.nodes) ? topology.room_graph.nodes.slice(0, 80)
         .map((node) => typeof node === 'object' ? {
           id: String(node.id || '').slice(0, 80), type: String(node.type || '').slice(0, 80),
         } : String(node).slice(0, 80)) : [],
-      edges: geometryApproved && Array.isArray(topology.room_graph?.edges) ? topology.room_graph.edges.slice(0, 120)
+      edges: Array.isArray(topology.room_graph?.edges) ? topology.room_graph.edges.slice(0, 120)
         .map((edge) => typeof edge === 'object' ? {
           source: String(edge.source || '').slice(0, 80), target: String(edge.target || '').slice(0, 80),
           type: String(edge.type || '').slice(0, 80),
         } : String(edge).slice(0, 160)) : [],
-    },
-    imageSemanticEvidence: geometryApproved ? null : {
-      specificationStatus: guidance.specificationStatus,
-      specificationConfidence: guidance.specificationConfidence,
-      specificationSummary: String(guidance.specificationSummary || '').slice(0, 500),
-      reviewSummary: String(guidance.reviewSummary || '').slice(0, 500),
-      visibleSpaces: Array.isArray(commercialFloor.spaces) ? commercialFloor.spaces.slice(0, 80).map((space) => ({
-        id: space.id, name: space.name, type: space.type, evidence: space.evidence,
-      })) : [],
-      circulation: commercialFloor.circulation || {},
-      fireLifeSafety: commercialFloor.fireLifeSafety || {},
     },
   };
 }
@@ -479,7 +486,7 @@ async function groqVision(request, env, cors, apiKey) {
     ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
   ];
 
-  const data = await callGroq(apiKey, {
+  const visionPayload = {
     model: env.GROQ_VISION_MODEL,
     messages: [
       { role: 'system', content: VISION_SYSTEM },
@@ -487,8 +494,31 @@ async function groqVision(request, env, cors, apiKey) {
     ],
     temperature: 0.2,
     max_completion_tokens: 1200,
+    // Qwen 3.6 defaults toward its thinking mode, which can consume the entire
+    // completion budget on hidden reasoning tokens for a complex/alarming scene
+    // and return empty content (json_validate_failed with no failed_generation).
+    // Force non-thinking mode so tokens go to the JSON response itself.
+    reasoning_effort: 'none',
     response_format: { type: 'json_object' },
-  });
+  };
+  let data = await callGroq(apiKey, visionPayload);
+  // Groq JSON Object Mode can emit invalid JSON (json_validate_failed). The docs
+  // prescribe a validate-and-retry; do exactly one reinforced retry.
+  if (data.error && data.code === 'json_validate_failed') {
+    data = await callGroq(apiKey, {
+      ...visionPayload,
+      messages: [
+        { role: 'system', content: VISION_SYSTEM },
+        { role: 'user', content },
+        {
+          role: 'user',
+          content: 'Your previous reply failed JSON validation. Return exactly one '
+            + 'valid JSON object of the requested shape, with no markdown, comments '
+            + 'or trailing text.',
+        },
+      ],
+    });
+  }
   if (data.error) return json({ error: data.error }, data.status, { ...cors, ...data.headers });
   const parsed = safeJson(data.json?.choices?.[0]?.message?.content);
   return json({ detections: parsed?.detections ?? parsed ?? [] }, 200, cors);
@@ -633,14 +663,17 @@ async function callGroq(apiKey, payload) {
   let body;
   try { body = await upstream.json(); } catch { body = null; }
   if (!upstream.ok) {
-    console.error(JSON.stringify({ message: 'Groq call failed', status: upstream.status, model: payload.model }));
     const detail = body?.error && typeof body.error === 'object' ? body.error : {};
     const code = String(detail.code || detail.type || '').slice(0, 100);
     const message = String(detail.message || '').slice(0, 500);
+    // Server-log only diagnostic: never returned to the client. Helps debug
+    // json_validate_failed (Groq includes the model's raw non-JSON output here).
+    console.error(JSON.stringify({ message: 'Groq call failed', status: upstream.status, model: payload.model, code }));
     const providerDetail = [code, message].filter(Boolean).join(': ');
     return {
       error: `Groq call failed (${upstream.status})${providerDetail ? `: ${providerDetail}` : ''}`,
       status: upstream.status,
+      code,
       headers: groqRateLimitHeaders(upstream.headers),
     };
   }
@@ -696,15 +729,19 @@ const FINAL_INSTRUCTION =
   + 'Base every finding only on the query_nbc tool results already gathered.';
 
 const PLAN_REASON_SYSTEM =
-  'You are FireShield AI assessing a reconstructed building plan against NBCS 2026 Part F (India). '
-  + 'The geometry was extracted deterministically and reviewed by Qwen. Treat Qwen as a visual reviewer, '
-  + 'not as a code authority. Use only the supplied NBCS guidance for regulatory requirements and cite its '
-  + 'page and clause identifiers. Never infer scale, occupancy, door purpose, exit designation, fire rating, '
-  + 'travel path, stair discharge, or protection equipment when the structured plan does not establish it. '
-  + 'When assessmentMode is image_semantic, provide useful visual/semantic observations and NBCS follow-up '
-  + 'requirements, but never use rejected geometry for numeric pass/fail conclusions. '
-  + 'If units are px or the Qwen review is insufficient, measurements are cannot_verify. A missing detected '
-  + 'object is not proof of absence. Return JSON only: {"planSummary":string,"score":number,'
+  'You are FireShield AI assessing a building plan against NBCS 2026 Part F (India). '
+  + 'The `plan` geometry (walls, rooms, doors, windows, exteriorBoundary, roomGraph) was extracted '
+  + 'deterministically from the drawing and is the authoritative geometric evidence — always reason over it. '
+  + '`visionAdvisory` is a SEPARATE Qwen visual stream: use it only as supporting context for space labels and '
+  + 'visible safety features; it is advisory and never overrides or invalidates the geometry. '
+  + 'Use only the supplied NBCS guidance for regulatory requirements and cite its page and clause identifiers. '
+  + 'Never infer occupancy, door purpose, exit designation, fire rating, or protection equipment the structured '
+  + 'plan does not establish. When assessmentMode is verified_geometry, printed scale was recovered: reason over '
+  + 'absolute widths, areas and travel distances. When assessmentMode is geometry_unscaled, the geometry is '
+  + 'trustworthy but scale was not recovered: reason over counts, connectivity, relative geometry and layout, '
+  + 'and mark only absolute-dimension checks (metre widths, travel distances) as cannot_verify. When '
+  + 'assessmentMode is image_semantic, no geometry was extracted: rely on visionAdvisory observations. '
+  + 'A missing detected object is not proof of absence. Return JSON only: {"planSummary":string,"score":number,'
   + '"findings":[{"check":string,"status":"compliant"|"gap"|"critical_gap"|"cannot_verify",'
   + '"severity":"minor"|"major"|"critical","observed":string,"required":string,"measurementEvidence":string,'
   + '"clauseId":string,"page":number|null,"rationale":string}],'

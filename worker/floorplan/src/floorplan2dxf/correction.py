@@ -62,20 +62,21 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
             wall_type = str(target.get("kind", "unknown")) if target.get("kind") in {
                 "external", "internal"
             } else "unknown"
-            snapped = Wall(
-                id=best.id, start=best.start, end=best.end,
-                thickness_mm=best.thickness_mm, wall_type=wall_type,
-            )
-            if not any(_same_segment(snapped.start, snapped.end, item.start, item.end, 5)
+            if not any(_same_segment(best.start, best.end, item.start, item.end, 5)
                        for item in matched):
-                matched.append(snapped)
+                # Label the matched deterministic wall in place. The vision spec
+                # never replaces the traced geometry, so every thick structural
+                # line survives even when Qwen's coordinates are misaligned.
+                best.wall_type = wall_type
+                matched.append(best)
                 if wall_type == "external":
                     external_points.extend((start, end))
 
-    # A usable vision spec is allowed to suppress unmatched Hough lines, which
-    # are commonly furniture, text underlines or dimension strokes.
+    # Non-destructive: the deterministic tracer remains the geometry authority.
+    # The vision spec only annotates which traced walls are external/internal;
+    # unmatched thick lines are kept (they were already filtered from furniture,
+    # text and dimension strokes upstream), so no information is lost.
     _snap_external_junctions(matched, tolerance=max(4.0, scale * 0.025))
-    cv_geom.walls = matched
     if len(external_points) >= 4:
         xs = [point[0] for point in external_points]
         ys = [point[1] for point in external_points]
@@ -118,16 +119,18 @@ def constrain_geometry_to_spec(cv_geom, plan_spec: dict, image_size: tuple[int, 
             try:
                 x0, y0, x1, y1 = map(float, target["bbox"])
                 if 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height:
-                    selected_rooms.append(Room(
-                        id=f"room_{len(selected_rooms)}",
+                    new_room = Room(
+                        id=f"room_spec_{len(selected_rooms)}",
                         type=str(target.get("type", "UNDEFINED"))[:40].upper(),
                         label=str(target.get("label", ""))[:80] or None,
                         boundary=[(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
-                    ))
+                    )
+                    # Additive: a vision-only room the tracer missed is appended,
+                    # never used to replace the deterministic room set.
+                    cv_geom.rooms.append(new_room)
+                    selected_rooms.append(new_room)
             except (TypeError, ValueError):
                 pass
-    if selected_rooms:
-        cv_geom.rooms = selected_rooms
 
     return {
         "applied": True,

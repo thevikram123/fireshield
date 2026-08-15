@@ -16,7 +16,9 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
 from .guidance import QwenTopologyGuide
+from .ingest import load_raster
 from .pipeline import convert
+from .preprocess import preprocess
 
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -70,25 +72,14 @@ async def convert_plan(
         raise HTTPException(400, "PDF page must be between 0 and 100.")
     profile = _building_profile(building_profile)
 
-    guide = None
-    vision_setup_warning = ""
-    if require_qwen:
-        try:
-            guide = QwenTopologyGuide(
-                api_key=groq_api_key,
-                building_profile=profile,
-            )
-        except RuntimeError as exc:
-            vision_setup_warning = (
-                f"Vision guidance unavailable; best-available deterministic artifacts were still produced: {exc}"
-            )
-
     try:
         with tempfile.TemporaryDirectory(prefix="fireshield-plan-") as temp:
             work = Path(temp)
             source = work / f"source{suffix}"
             source.write_bytes(payload)
             dxf = work / "plan.dxf"
+            # Geometry stream: always deterministic. OpenCV tracing is the sole
+            # geometry authority; no vision model may replace or edit the DXF.
             result = convert(
                 source,
                 out=dxf,
@@ -97,11 +88,14 @@ async def convert_plan(
                 weights=Path("/app/weights/model_best_val_loss_var.pkl"),
                 use_model=os.environ.get("ENABLE_NONCOMMERCIAL_CUBICASA") == "1",
                 ocr=os.environ.get("ENABLE_EASYOCR_RUNTIME") == "1",
-                guide=guide,
+                guide=None,
                 guide_required=False,
             )
-            if vision_setup_warning:
-                result.warnings.append(vision_setup_warning)
+            # Qwen stream: a separate, parallel advisory read of the same image.
+            # It enriches the reasoning context (space labels, visible safety
+            # features) but never touches the traced geometry above.
+            vision_advisory = _qwen_advisory(
+                source, page, groq_api_key, profile) if require_qwen else {"status": "disabled"}
             json_path = result.json_path
             overlay_path = result.overlay_path
             return {
@@ -109,21 +103,7 @@ async def convert_plan(
                 "topology": result.model.to_dict(),
                 "commercialModel": result.commercial_model,
                 "warnings": result.warnings,
-                "guidance": {
-                    "required": require_qwen,
-                    "specificationStatus": guide.audit.specification_status if guide else "not_run",
-                    "specificationConfidence": guide.audit.specification_confidence if guide else 0,
-                    "specificationSummary": guide.audit.specification_summary if guide else "",
-                    "initialReviewStatus": guide.audit.initial_review_status if guide else "not_run",
-                    "reviewStatus": guide.audit.review_status if guide else "not_run",
-                    "reviewConfidence": guide.audit.review_confidence if guide else 0,
-                    "reviewSummary": guide.audit.review_summary if guide else "",
-                    "discrepancies": guide.audit.discrepancies if guide else [],
-                    "accepted": guide.audit.accepted if guide else [],
-                    "rejected": guide.audit.rejected if guide else [],
-                    "correctionStatus": guide.audit.correction_status if guide else "not_run",
-                    "correctionModel": guide.audit.correction_model if guide else "",
-                },
+                "visionAdvisory": vision_advisory,
                 "artifacts": {
                     "plan.dxf": _artifact(dxf, "application/dxf"),
                     "plan.json": _artifact(json_path, "application/json") if json_path else None,
@@ -145,6 +125,54 @@ async def convert_plan(
         raise
     except Exception as exc:
         raise HTTPException(422, f"Plan conversion failed: {exc}") from exc
+
+
+def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) -> dict:
+    """Separate Qwen visual stream. Advisory only — it never constrains the DXF.
+
+    Returns the model's semantic read of the plan (spaces, openings, visible
+    safety features) so GPT-OSS can reason over it *alongside* the deterministic
+    geometry. Any failure degrades to an explicit status, never to a fake result.
+    """
+    try:
+        guide = QwenTopologyGuide(api_key=api_key, building_profile=profile)
+    except RuntimeError as exc:
+        return {"status": "unavailable", "detail": str(exc)[:300]}
+    try:
+        raster = load_raster(source, page=page)
+        prep = preprocess(raster.rgb)
+        spec = guide.specify(prep.display_rgb)
+    except Exception as exc:  # noqa: BLE001 - advisory stream must not fail the request
+        return {"status": "unavailable", "detail": str(exc)[:300]}
+    return {
+        "status": guide.audit.specification_status,
+        "confidence": guide.audit.specification_confidence,
+        "summary": guide.audit.specification_summary,
+        "spaces": [
+            {
+                "label": str(item.get("label", ""))[:80],
+                "type": str(item.get("type", ""))[:40],
+                "category": str(item.get("category", ""))[:20],
+                "center": item.get("center"),
+            }
+            for item in list(spec.get("spaces") or [])[:80]
+            if isinstance(item, dict)
+        ],
+        "openings": [
+            {"type": str(item.get("type", ""))[:20], "center": item.get("center")}
+            for item in list(spec.get("openings") or [])[:80]
+            if isinstance(item, dict)
+        ],
+        "elements": [
+            {
+                "kind": str(item.get("kind", ""))[:40],
+                "category": str(item.get("category", ""))[:20],
+                "label": str(item.get("label", ""))[:80],
+            }
+            for item in list(spec.get("elements") or [])[:80]
+            if isinstance(item, dict)
+        ],
+    }
 
 
 def _artifact(path: Path, mime: str) -> dict:
