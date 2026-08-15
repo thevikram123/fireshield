@@ -281,14 +281,15 @@ test('plan compliance can query_nbc for a specific measured condition before con
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.compliance.findings[0].status, 'compliant');
-  // Tool-requesting hop, second hop, then the forced strict-schema final call.
-  assert.equal(groqCalls.length, 3);
+  // One lookup hop, then the forced strict-schema final call. Kept at one hop
+  // because each extra hop is another full-history gpt-oss call, which on the
+  // 8000 TPM/min free tier caused 429s and tripled the wait.
+  assert.equal(groqCalls.length, 2);
   assert.ok(groqCalls[0].tools.some((tool) => tool.function.name === 'query_nbc'));
   // Tool-selection hops run on the light model so they don't burn the same
   // 8000 TPM/min pool the final 120b verdict call (and any concurrent
   // site/photo audit reasonCompliance call) draws on.
   assert.equal(groqCalls[0].model, 'openai/gpt-oss-20b');
-  assert.equal(groqCalls[1].model, 'openai/gpt-oss-20b');
   const final = groqCalls[groqCalls.length - 1];
   assert.equal(final.model, 'openai/gpt-oss-120b');
   assert.equal(final.tool_choice, 'none');

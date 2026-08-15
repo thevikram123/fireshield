@@ -27,15 +27,22 @@ const GROQ_BASE = 'https://api.groq.com/openai/v1';
 const MAX_JSON_BYTES = 48_000;
 const MAX_VISION_BYTES = 22 * 1024 * 1024; // 5 images * ~4MB + JSON overhead
 const MAX_TOOL_HOPS = 4;
-const PLAN_MAX_TOOL_HOPS = 3;
+// One lookup round, not three. Each extra hop is another gpt-oss call carrying
+// the whole growing history, which on an 8000 TPM/min free tier both exhausted
+// the budget (429s with ~45s cooldowns) and tripled the wait for a result. One
+// round still lets the model fetch the clauses it needs before concluding.
+const PLAN_MAX_TOOL_HOPS = 1;
 // Groq's free-tier TPM counts input tokens PLUS max_completion_tokens against
 // the same 8000/min budget, so a single request can be rejected outright with
 // 413 "Request too large" — no waiting or model-switching can rescue it, the
 // payload itself must fit. The tool-calling loop is what blew past this: each
 // hop appends an assistant message plus tool results, so by the final call the
 // accumulated history plus the reserved completion budget exceeded 8000.
-const GROQ_TPM_BUDGET = 7200; // headroom under the hard 8000 cap
-const PLAN_FINAL_MAX_TOKENS = 1400;
+// Well under the hard 8000 cap: the budget is shared with whatever else the
+// session just did, and the 429s showed ~7900 already consumed before a plan
+// assessment even started.
+const GROQ_TPM_BUDGET = 5200;
+const PLAN_FINAL_MAX_TOKENS = 1100;
 const REASON_HOP_MAX_TOKENS = 700;
 const REASON_FINAL_MAX_TOKENS = 1600;
 const TOOL_RESULT_MAX_CHARS = 1500;
@@ -892,7 +899,10 @@ async function nbcQueryRoute(request, env, cors) {
 }
 
 // ── Groq call helper ─────────────────────────────────────────────────────────
-const MAX_RATE_LIMIT_WAIT_MS = 25_000;
+// Groq's TPM cooldowns run to ~45s, and a wait that returns a real assessment
+// beats surfacing a rate-limit error to the user. Capped below the Worker's
+// own request timeout so the wait can never outlive the request.
+const MAX_RATE_LIMIT_WAIT_MS = 50_000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -16,7 +16,8 @@ from .overlay import write_overlay
 from .preprocess import preprocess
 from .recognize import MissingWeights, Recognition, load_model, recognize, remap_recognition
 from .reconstruct import apply_scale, reconstruct
-from .schema import FloorplanModel
+from .openings import detect_openings
+from .schema import Door, FloorplanModel, Window
 from .topology import derive_topology
 
 
@@ -126,6 +127,29 @@ def convert(
             if guide_required:
                 raise
             warnings.append(f"Vision guidance failed ({exc}); keeping deterministic topology.")
+
+    # Doors/windows read straight off the drawing convention (swing arcs, and
+    # hollow boxes inside exterior wall bands). This is the only source of
+    # openings when the CubiCasa recogniser is disabled, and unlike a vision
+    # read it yields measurable pixel widths. Purely additive: it never runs if
+    # the recogniser already produced openings, and never touches walls/rooms.
+    if not plan.doors and not plan.windows:
+        try:
+            for index, opening in enumerate(
+                detect_openings(prep.display_rgb, prep.wall_mask, cv_geom.walls)
+            ):
+                if opening.kind == "door":
+                    plan.doors.append(Door(
+                        id=f"door_{index}", wall_id=opening.wall_id,
+                        width_mm=float(opening.width_px), center=opening.center,
+                    ))
+                else:
+                    plan.windows.append(Window(
+                        id=f"window_{index}", wall_id=opening.wall_id,
+                        width_mm=float(opening.width_px), center=opening.center,
+                    ))
+        except Exception as exc:  # noqa: BLE001 - openings must never fail a conversion
+            warnings.append(f"Opening detection failed ({exc}); walls and rooms are unaffected.")
 
     if cv_geom.envelope:
         x0, y0, x1, y1 = cv_geom.envelope
