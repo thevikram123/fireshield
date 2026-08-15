@@ -296,8 +296,31 @@ def _room_contains(room, center, tolerance: float) -> bool:
         return False
     return min(xs) - tolerance <= x <= max(xs) + tolerance and min(ys) - tolerance <= y <= max(ys) + tolerance
 
+#: Longest edge sent to the vision model. Image tokens dominate the cost of a
+#: vision call, and the daily budget is what actually runs out (observed:
+#: 197,885 of 200,000 tokens per day consumed, which disables the advisory
+#: stream entirely — no space labels, no openings and no printed-dimension
+#: read, so scale cannot be recovered). Printed dimension text stays legible
+#: well below the full preprocessed size, so capping here buys a large
+#: multiple of extra calls per day for no practical loss of reading accuracy.
+QWEN_MAX_SIDE = 768
+
+
+def _downscale_for_vision(rgb: np.ndarray, max_side: int = QWEN_MAX_SIDE) -> np.ndarray:
+    height, width = rgb.shape[:2]
+    longest = max(height, width)
+    if longest <= max_side:
+        return rgb
+    ratio = max_side / float(longest)
+    return cv2.resize(
+        rgb, (max(1, int(round(width * ratio))), max(1, int(round(height * ratio)))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def _qwen_json(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
-        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
+        rgb = _downscale_for_vision(rgb)
+        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
         if not ok:
             raise RuntimeError("could not encode plan image")
         image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")

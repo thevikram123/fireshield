@@ -42,7 +42,11 @@ const PLAN_MAX_TOOL_HOPS = 1;
 // session just did, and the 429s showed ~7900 already consumed before a plan
 // assessment even started.
 const GROQ_TPM_BUDGET = 5200;
-const PLAN_FINAL_MAX_TOKENS = 1100;
+// The verdict must fit a complete JSON object (summary, findings, citations,
+// limitations). Squeezing this to 1100 truncated the generation mid-object and
+// failed schema validation, so it is sized to finish the response while input
+// plus output still stays under the 8000/min cap.
+const PLAN_FINAL_MAX_TOKENS = 1600;
 const REASON_HOP_MAX_TOKENS = 700;
 const REASON_FINAL_MAX_TOKENS = 1600;
 const TOOL_RESULT_MAX_CHARS = 1500;
@@ -345,13 +349,18 @@ async function assessFloorplan(converted, env, apiKey) {
   // path. Without this a single malformed generation discarded an otherwise
   // complete assessment and surfaced as "provider did not return an assessment".
   if (finalData.error && finalData.code === 'json_validate_failed') {
+    // The usual cause is the generation being cut off mid-object, so the retry
+    // both asks for a compact answer and raises the completion room rather than
+    // repeating the same budget that truncated.
     finalData = await callGroq(apiKey, {
       ...finalPayload,
+      max_completion_tokens: PLAN_FINAL_MAX_TOKENS + 400,
       messages: [...finalMessages, {
         role: 'user',
-        content: 'Your previous reply failed schema validation. Return exactly one JSON object '
-          + 'matching the schema. Use null (not a missing field) for clauseId or page when a '
-          + 'finding has no clause to cite, and include every required field.',
+        content: 'Your previous reply failed schema validation, most likely because it was cut '
+          + 'off. Return exactly one COMPLETE JSON object with every required field present. '
+          + 'Keep it compact: at most six findings and short rationales. Use null (not a missing '
+          + 'field) for clauseId or page when a finding has no clause to cite.',
       }],
     });
   }
