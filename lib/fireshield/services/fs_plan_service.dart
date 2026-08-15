@@ -58,6 +58,11 @@ class FsPlanService {
 
   bool get isConfigured => _base.isNotEmpty;
 
+  // Shares the org's gpt-oss-120b TPM budget with the site/photo audit's
+  // reasonCompliance (fs_groq_service.dart) — same rate key so a wait learned
+  // from one screen paces the other, since a demo can hit either in any order.
+  static const _rateKey = 'gpt-oss-120b';
+
   Future<FsPlanResult> convert({
     required Uint8List bytes,
     required String filename,
@@ -65,6 +70,7 @@ class FsPlanService {
     int page = 0,
     String? overall,
     Map<String, dynamic> buildingProfile = const {},
+    bool retriedAfterRateLimit = false,
   }) async {
     if (!isConfigured) {
       throw const FsServiceException(
@@ -76,6 +82,9 @@ class FsPlanService {
     if (bytes.length > 25 * 1024 * 1024) {
       throw const FsServiceException('The selected plan exceeds 25 MB.');
     }
+    final wait = FsGroqRateTracker.waitBefore(_rateKey, 3000);
+    if (wait > Duration.zero) await Future.delayed(wait);
+
     final request =
         http.MultipartRequest('POST', Uri.parse('$_base/plan/convert'))
           ..fields['page'] = '$page'
@@ -101,6 +110,7 @@ class FsPlanService {
       final streamed =
           await _client.send(request).timeout(const Duration(minutes: 3));
       final response = await http.Response.fromStream(streamed);
+      FsGroqRateTracker.observe(_rateKey, response.headers);
       final decoded = jsonDecode(utf8.decode(response.bodyBytes));
       if (decoded is! Map<String, dynamic>) {
         throw const FsServiceException(
@@ -112,6 +122,28 @@ class FsPlanService {
               decoded['error']?.toString() ??
               'Plan conversion failed.',
           status: response.statusCode,
+        );
+      }
+      // Geometry conversion always succeeds standalone; only the embedded
+      // compliance step can be TPM-limited (200 + partial:true). Re-running
+      // the whole conversion is the only lever available (no compliance-only
+      // endpoint), so retry once, dynamically, using Groq's own cooldown.
+      final compliance = decoded['compliance'] as Map<String, dynamic>?;
+      final retryAfter = (compliance?['retryAfterSeconds'] as num?)?.toDouble();
+      if (decoded['partial'] == true &&
+          !retriedAfterRateLimit &&
+          retryAfter != null &&
+          retryAfter > 0 &&
+          Duration(milliseconds: (retryAfter * 1000).round()) <= FsGroqRateTracker.maxDynamicWait) {
+        await Future.delayed(Duration(milliseconds: (retryAfter * 1000).round()));
+        return convert(
+          bytes: bytes,
+          filename: filename,
+          mimeType: mimeType,
+          page: page,
+          overall: overall,
+          buildingProfile: buildingProfile,
+          retriedAfterRateLimit: true,
         );
       }
       return FsPlanResult.fromJson(decoded);

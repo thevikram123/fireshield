@@ -63,6 +63,28 @@ double? _parseGroqDuration(String? raw) {
   return minutes * 60 + seconds;
 }
 
+/// Process-wide Groq quota tracker, shared across every service that draws
+/// on the same model budget (site/photo audit's reasonCompliance here,
+/// floor-plan compliance in fs_plan_service.dart). Different screens create
+/// their own FsGroqService/FsPlanService instances, so this has to be a
+/// static/global singleton — instance-level state wouldn't see calls made
+/// from the other screen and a demo bouncing between features would still
+/// collide into the same TPM window blind.
+class FsGroqRateTracker {
+  FsGroqRateTracker._();
+  static const maxDynamicWait = Duration(seconds: 45);
+  static final Map<String, _RateWindow> _windows = {};
+
+  static Duration waitBefore(String rateKey, int estimatedTokens) {
+    final wait = _windows.putIfAbsent(rateKey, () => _RateWindow()).waitBefore(estimatedTokens);
+    return wait < maxDynamicWait ? wait : maxDynamicWait;
+  }
+
+  static void observe(String rateKey, Map<String, String> headers) {
+    _windows.putIfAbsent(rateKey, () => _RateWindow()).observe(headers);
+  }
+}
+
 class _RawResponse {
   final int status;
   final Map<String, dynamic>? decoded;
@@ -77,19 +99,18 @@ class FsGroqService {
 
   final http.Client _client;
   final String _base;
-  final Map<String, _RateWindow> _rateWindows = {};
 
   static const _timeout = Duration(seconds: 60);
-  static const _maxDynamicWait = Duration(seconds: 45);
 
   bool get isConfigured => _base.isNotEmpty;
 
   Uri _uri(String path) => Uri.parse('$_base$path');
 
-  /// [rateKey] groups calls that share a Groq quota (roughly: the path/model)
-  /// so a wait derived from one call's headers applies to the next same-kind
-  /// call, not unrelated ones. [estimatedTokens] is only used to decide
-  /// whether it's worth waiting at all — never to hardcode the wait itself.
+  /// [rateKey] groups calls that share a Groq quota (roughly: the model) via
+  /// the process-wide [FsGroqRateTracker], so a wait derived from one call's
+  /// headers applies to the next same-kind call — including calls made from
+  /// a completely different screen/service instance. [estimatedTokens] only
+  /// decides whether it's worth waiting at all, never the wait length itself.
   Future<Map<String, dynamic>> _post(
     String path,
     Map<String, dynamic> body, {
@@ -101,23 +122,20 @@ class FsGroqService {
           'AI service not configured — set FIRESHIELD_WORKER_URL at build time.');
     }
     final key = rateKey ?? path;
-    final window = _rateWindows.putIfAbsent(key, () => _RateWindow());
-    final wait = window.waitBefore(estimatedTokens);
-    if (wait > Duration.zero) {
-      await Future.delayed(wait < _maxDynamicWait ? wait : _maxDynamicWait);
-    }
+    final wait = FsGroqRateTracker.waitBefore(key, estimatedTokens);
+    if (wait > Duration.zero) await Future.delayed(wait);
 
     final result = await _postOnce(path, body);
-    window.observe(result.headers);
+    FsGroqRateTracker.observe(key, result.headers);
     if (result.decoded?['error'] != null) {
       final retryAfter = (result.decoded?['retryAfterSeconds'] as num?)?.toDouble();
       if (retryAfter != null && retryAfter > 0 &&
-          Duration(milliseconds: (retryAfter * 1000).round()) <= _maxDynamicWait) {
+          Duration(milliseconds: (retryAfter * 1000).round()) <= FsGroqRateTracker.maxDynamicWait) {
         // One dynamic, header-driven retry — mirrors the Worker's own backoff
         // so a same-window collision doesn't surface as a hard failure here.
         await Future.delayed(Duration(milliseconds: (retryAfter * 1000).round()));
         final retried = await _postOnce(path, body);
-        window.observe(retried.headers);
+        FsGroqRateTracker.observe(key, retried.headers);
         return _unwrap(retried);
       }
     }
