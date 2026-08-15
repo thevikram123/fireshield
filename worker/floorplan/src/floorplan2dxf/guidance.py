@@ -95,9 +95,25 @@ class QwenTopologyGuide:
             with urllib.request.urlopen(req, timeout=60) as response:
                 result = json.load(response)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Qwen request failed ({exc.code})") from exc
+            provider_message = _provider_error_message(exc)
+            suffix = f": {provider_message}" if provider_message else ""
+            raise RuntimeError(f"Qwen request failed ({exc.code}){suffix}") from exc
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
         return json.loads(content)
+
+
+def _provider_error_message(error: urllib.error.HTTPError) -> str:
+    """Return only Groq's bounded error message/code, never headers or keys."""
+    try:
+        payload = json.loads(error.read(4096).decode("utf-8", errors="replace"))
+        detail = payload.get("error", payload) if isinstance(payload, dict) else {}
+        if not isinstance(detail, dict):
+            return ""
+        message = str(detail.get("message", ""))[:500]
+        code = str(detail.get("code", ""))[:100]
+        return f"{code}: {message}" if code and code not in message else message
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
 
 
 def apply_guidance(
