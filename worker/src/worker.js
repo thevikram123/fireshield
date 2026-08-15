@@ -208,13 +208,14 @@ async function assessFloorplan(converted, env, apiKey) {
     { role: 'user', content: fitPlanReasoningContext(plan, []) },
   ];
 
-  // Same split as groqReason: tool-selection hops run on gpt-oss-20b (its own
+  // Same split as groqReason: tool-selection hops prefer gpt-oss-20b (its own
   // TPM pool) so they don't eat into the 8000 TPM/min budget the final
-  // gpt-oss-120b verdict call below needs — and don't collide with a
-  // concurrent site/photo audit's reasonCompliance, which draws on the same
-  // 120b pool.
-  const hopModel = env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL;
+  // gpt-oss-120b verdict call below needs. Re-picked every hop so a currently
+  // tight 20b pool (e.g. from a concurrent site/photo audit hop) doesn't get
+  // blindly retried — it automatically switches to whichever model has room.
   for (let hop = 0; hop < PLAN_MAX_TOOL_HOPS; hop++) {
+    const hopModel = pickAvailableModel(
+      env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, 900);
     const data = await callGroq(apiKey, {
       model: hopModel,
       messages,
@@ -251,8 +252,13 @@ async function assessFloorplan(converted, env, apiKey) {
     }
   }
 
+  // Prefer 120b for the actual verdict; switch to 20b only if 120b's pool is
+  // the one currently tight. If 20b turns out not to support strict schema
+  // mode either, this is no worse than today — the call still errors and
+  // degrades to the existing partial-response path below.
+  const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, 1600);
   const finalData = await callGroq(apiKey, {
-    model: env.GROQ_REASON_MODEL,
+    model: finalModel,
     messages: [...messages, {
       role: 'user',
       content: 'Now output the final compliance assessment as JSON only, matching the schema.',
@@ -331,11 +337,15 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
   if (serialized.length <= maxChars) return serialized;
 
   const sourceCounts = {
+    walls: context.plan.walls.length,
     rooms: context.plan.rooms.length,
     doors: context.plan.doors.length,
     windows: context.plan.windows.length,
     objects: context.plan.objects.length,
   };
+  // Walls are the core geometry evidence (see the walls-omission bug this
+  // fixed: a plan with real traced walls must never reach the model looking
+  // like it has none) — trim last and lightest, everything else first.
   context.plan.rooms = context.plan.rooms.slice(0, 25);
   context.plan.doors = context.plan.doors.slice(0, 40);
   context.plan.windows = context.plan.windows.slice(0, 40);
@@ -345,6 +355,7 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
   context.plan.contextCoverage = {
     sourceCounts,
     includedCounts: {
+      walls: context.plan.walls.length,
       rooms: context.plan.rooms.length,
       doors: context.plan.doors.length,
       windows: context.plan.windows.length,
@@ -355,8 +366,10 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
   serialized = JSON.stringify(context);
   if (serialized.length <= maxChars) return serialized;
 
-  // Final bounded form still carries aggregate metrics, visual-review status,
-  // coverage disclosure and the top cited result for each regulatory topic.
+  // Walls still get cut before being zeroed entirely, but only here, and only
+  // down to a bound — never to nothing, since assessmentMode/hasGeometry
+  // already told the model geometry exists and it must not contradict that.
+  context.plan.walls = context.plan.walls.slice(0, 60);
   context.plan.rooms = [];
   context.plan.doors = [];
   context.plan.windows = [];
@@ -452,6 +465,14 @@ function compactPlanForReasoning(converted) {
     imageSize: topology.image_size,
     exteriorBoundary: Array.isArray(topology.exterior_boundary)
       ? topology.exterior_boundary.slice(0, 60).map(point) : [],
+    // The actual traced wall segments — this is the geometry the system
+    // prompt tells gpt-oss to reason over. It was missing entirely before:
+    // only the wallCount (via metrics) reached the model, so a plan with 37
+    // correctly-traced walls still read as "no wall geometry" to the model.
+    walls: Array.isArray(topology.walls) ? topology.walls.slice(0, 120).map((wall) => ({
+      id: wall.id, start: point(wall.start), end: point(wall.end),
+      wall_type: wall.wall_type, thickness_mm: wall.thickness_mm,
+    })) : [],
     rooms: Array.isArray(topology.rooms) ? topology.rooms.slice(0, 50).map((room) => ({
       id: room.id, type: room.type, label: room.label,
       area_mm2: room.area_mm2,
@@ -463,6 +484,22 @@ function compactPlanForReasoning(converted) {
     windows: Array.isArray(topology.windows) ? topology.windows.slice(0, 80).map((window) => ({
       id: window.id, wall_id: window.wall_id, width_mm: window.width_mm, center: point(window.center),
     })) : [],
+    // The deterministic door/window detector needs the CubiCasa model, which
+    // is disabled at runtime (Render memory limit) — plan.doors/windows are
+    // then genuinely empty, not a bug. Qwen's specify() call already reads
+    // door/window openings in that same single pass (no extra Groq call, no
+    // extra TPM cost) — surface it as real evidence with counts computed here
+    // rather than leaving gpt-oss to count array entries itself.
+    visionOpenings: (() => {
+      const items = (Array.isArray(advisory.openings) ? advisory.openings : [])
+        .slice(0, 80)
+        .map((item) => ({ type: String(item?.type || '').slice(0, 20), center: point(item?.center) }));
+      return {
+        doorCount: items.filter((item) => item.type === 'door').length,
+        windowCount: items.filter((item) => item.type === 'window').length,
+        items,
+      };
+    })(),
     objects: Array.isArray(topology.objects) ? topology.objects.slice(0, 80).map((object) => ({
       id: object.id, type: object.type, center: point(object.center), confidence: object.confidence,
     })) : [],
@@ -653,13 +690,15 @@ async function groqReason(request, env, cors, apiKey) {
   ];
 
   // Tool-calling loop: let gpt-oss pull the exact clauses it needs. Deciding
-  // *which* clause to look up is a light task — run the hops on gpt-oss-20b
-  // (a separate TPM pool) and reserve gpt-oss-120b for the final synthesis
-  // below. Otherwise every hop of a single P6 call re-hits the same skinny
-  // 8000 TPM/min budget back-to-back and can exhaust it before the request
-  // that actually needs 120b's reasoning even runs.
-  const hopModel = env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL;
+  // *which* clause to look up is a light task — prefer gpt-oss-20b (a separate
+  // TPM pool) and reserve gpt-oss-120b for the final synthesis below.
+  // Re-picked every hop (not fixed once) so if 20b's own pool is the one
+  // currently tight — e.g. a concurrent floor-plan compliance hop just used
+  // it — this automatically falls through to whichever model actually has
+  // headroom right now, rather than blindly retrying the one that's tight.
   for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
+    const hopModel = pickAvailableModel(
+      env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, 1500);
     const data = await callGroq(apiKey, {
       model: hopModel,
       messages,
@@ -700,9 +739,14 @@ async function groqReason(request, env, cors, apiKey) {
     }
   }
 
-  // Force a final structured verdict grounded in the tool results.
+  // Force a final structured verdict grounded in the tool results. This is
+  // the step that actually needs 120b's reasoning strength, so it's the
+  // preferred model — but if 120b's pool is the one currently tight and 20b
+  // has room, switch automatically rather than fail a request 20b could
+  // still answer (degraded, but real, beats a hard 429 mid-demo).
+  const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, 2000);
   const finalData = await callGroq(apiKey, {
-    model: env.GROQ_REASON_MODEL,
+    model: finalModel,
     messages: [...messages, { role: 'user', content: FINAL_INSTRUCTION }],
     tool_choice: 'none',
     temperature: 0.2,
@@ -745,6 +789,60 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Best-effort, per-isolate memory of each model's last-known Groq quota.
+// Cloudflare may run multiple isolates across edge locations, so this isn't
+// a perfectly global view — but within one isolate (the common case for a
+// single demo session hitting the same nearby edge) it lets every call pick
+// whichever of gpt-oss-120b/gpt-oss-20b currently has headroom, instead of
+// a fixed model assignment that can still collide if that specific model's
+// pool is the one already under pressure.
+const groqQuota = {};
+
+function parseGroqDurationSeconds(raw) {
+  if (!raw) return null;
+  const match = /^(?:(\d+)m)?(\d+(?:\.\d+)?)(m?s)$/.exec(String(raw).trim());
+  if (!match) {
+    const plain = parseFloat(raw);
+    return Number.isFinite(plain) ? plain : null;
+  }
+  const minutes = parseFloat(match[1] || '0') || 0;
+  const value = parseFloat(match[2] || '0') || 0;
+  const seconds = match[3] === 'ms' ? value / 1000 : value;
+  return minutes * 60 + seconds;
+}
+
+function recordGroqQuota(model, headers) {
+  if (!model || !headers) return;
+  const remaining = Number(headers['x-ratelimit-remaining-tokens']);
+  if (!Number.isFinite(remaining)) return;
+  const resetSeconds = parseGroqDurationSeconds(headers['x-ratelimit-reset-tokens']);
+  groqQuota[model] = {
+    remainingTokens: remaining,
+    resetAt: resetSeconds != null ? Date.now() + resetSeconds * 1000 : (groqQuota[model]?.resetAt ?? 0),
+  };
+}
+
+function groqHasHeadroom(model, estimatedTokens) {
+  const state = groqQuota[model];
+  if (!state) return true; // never observed -> assume available
+  if (Date.now() >= state.resetAt) return true; // window has likely rolled over
+  return state.remainingTokens >= estimatedTokens;
+}
+
+/// Picks whichever of two models currently has headroom for roughly
+/// [estimatedTokens]. [preferred] wins when both look fine (it's the model
+/// suited to the task); otherwise falls through to [fallback], and if both
+/// look tight, picks whichever has more remaining as a last resort — the
+/// call still goes out and the existing 429 retry-after backoff covers it.
+function pickAvailableModel(preferred, fallback, estimatedTokens) {
+  if (!fallback || fallback === preferred) return preferred;
+  if (groqHasHeadroom(preferred, estimatedTokens)) return preferred;
+  if (groqHasHeadroom(fallback, estimatedTokens)) return fallback;
+  const preferredRemaining = groqQuota[preferred]?.remainingTokens ?? 0;
+  const fallbackRemaining = groqQuota[fallback]?.remainingTokens ?? 0;
+  return fallbackRemaining > preferredRemaining ? fallback : preferred;
+}
+
 async function callGroq(apiKey, payload, { retriedAfterRateLimit = false } = {}) {
   const upstream = await fetch(`${GROQ_BASE}/chat/completions`, {
     method: 'POST',
@@ -772,18 +870,22 @@ async function callGroq(apiKey, payload, { retriedAfterRateLimit = false } = {})
     // json_validate_failed (Groq includes the model's raw non-JSON output here).
     console.error(JSON.stringify({ message: 'Groq call failed', status: upstream.status, model: payload.model, code }));
     const providerDetail = [code, message].filter(Boolean).join(': ');
+    const errorHeaders = groqRateLimitHeaders(upstream.headers);
+    recordGroqQuota(payload.model, errorHeaders);
     return {
       error: `Groq call failed (${upstream.status})${providerDetail ? `: ${providerDetail}` : ''}`,
       status: upstream.status,
       code,
       retryAfterSeconds: parseFloat(upstream.headers.get('retry-after') || '0') || null,
-      headers: groqRateLimitHeaders(upstream.headers),
+      headers: errorHeaders,
     };
   }
   // Forward quota headers on success too (not just on 429). This is what lets
   // the client self-throttle its *next* call using Groq's own numbers —
   // x-ratelimit-remaining-tokens / -reset-tokens — instead of a fixed guess.
-  return { json: body, headers: groqRateLimitHeaders(upstream.headers) };
+  const successHeaders = groqRateLimitHeaders(upstream.headers);
+  recordGroqQuota(payload.model, successHeaders);
+  return { json: body, headers: successHeaders };
 }
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
@@ -840,6 +942,13 @@ const PLAN_REASON_SYSTEM =
   + 'deterministically from the drawing and is the authoritative geometric evidence — always reason over it. '
   + '`visionAdvisory` is a SEPARATE Qwen visual stream: use it only as supporting context for space labels and '
   + 'visible safety features; it is advisory and never overrides or invalidates the geometry. '
+  + '`plan.doors`/`plan.windows` come from a deterministic door/window detector that is often disabled — they '
+  + 'may legitimately be empty even when doors/windows are visibly present in the drawing. In that case, use '
+  + '`plan.visionOpenings` (Qwen\'s read, {doorCount, windowCount, items:[{type,center}]}) as the egress evidence '
+  + 'instead of treating an empty plan.doors/windows as proof none exist. Because it is advisory, still mark '
+  + 'absolute door/window widths as cannot_verify unless plan.doors/windows independently confirms a measured '
+  + 'width — but use visionOpenings.doorCount/windowCount for exit COUNT and presence so those checks are not '
+  + 'marked cannot_verify for no reason. '
   + 'Identify which fire-safety systems and life-safety checks this specific geometry implicates (exit count and '
   + 'width, travel distance, corridor width, compartmentation, detection/sprinkler coverage, refuge area, etc.), '
   + 'then use the query_nbc tool to fetch the exact NBCS requirement for each — including a specific measured '
@@ -1012,3 +1121,9 @@ function json(value, status, headers = {}) {
     status, headers: { ...headers, 'Content-Type': 'application/json; charset=utf-8' },
   });
 }
+
+// Test-only surface for the dynamic model-availability picker. groqQuota is
+// exported by reference so tests can seed/clear it directly without going
+// through the full HTTP+mock-fetch machinery (and without leaking state into
+// unrelated tests in the same process).
+export const __testing__ = { pickAvailableModel, groqQuota };

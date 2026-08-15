@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import worker from '../src/worker.js';
+import worker, { __testing__ } from '../src/worker.js';
 
 const origin = 'https://thevikram123.github.io';
 
@@ -45,6 +45,31 @@ test('health reports model, index, secret, and limiter bindings', async () => {
   assert.equal(body.nbcIndexConfigured, true);
   assert.equal(body.rateLimitsConfigured, true);
   assert.equal(body.floorplanConfigured, true);
+});
+
+test('the model picker switches to whichever pool actually has headroom', (t) => {
+  const { pickAvailableModel, groqQuota } = __testing__;
+  const HEAVY = 'openai/gpt-oss-120b';
+  const LIGHT = 'openai/gpt-oss-20b';
+  // groqQuota is shared module state (read by every real request too) —
+  // always leave it as found so this doesn't leak into other tests.
+  t.after(() => { delete groqQuota[HEAVY]; delete groqQuota[LIGHT]; });
+
+  // Nothing observed yet for either model: prefer the requested one.
+  assert.equal(pickAvailableModel(LIGHT, HEAVY, 900), LIGHT);
+  assert.equal(pickAvailableModel(HEAVY, LIGHT, 1600), HEAVY);
+
+  // The preferred (light) pool is known-tight, the other has room: switch.
+  groqQuota[LIGHT] = { remainingTokens: 5, resetAt: Date.now() + 30_000 };
+  assert.equal(pickAvailableModel(LIGHT, HEAVY, 900), HEAVY);
+
+  // Both known-tight: pick whichever has more remaining, rather than refuse.
+  groqQuota[HEAVY] = { remainingTokens: 50, resetAt: Date.now() + 30_000 };
+  assert.equal(pickAvailableModel(LIGHT, HEAVY, 900), HEAVY);
+
+  // The tight window has since rolled over: treat it as available again.
+  groqQuota[LIGHT] = { remainingTokens: 5, resetAt: Date.now() - 1 };
+  assert.equal(pickAvailableModel(LIGHT, HEAVY, 900), LIGHT);
 });
 
 test('rate-limit headers are exposed cross-origin so the client can read them', async () => {
@@ -215,10 +240,13 @@ test('a non-approving Qwen advisory never strips the deterministic geometry', as
           status: 'insufficient', confidence: 0.91,
           summary: 'Commercial office and fire stair visible.',
           spaces: [{ label: 'Office', type: 'OFFICE' }],
+          openings: [{ type: 'door', center: [25, 0] }, { type: 'window', center: [400, 0] }],
         },
         topology: {
           units: 'mm', mm_per_px: 10,
-          walls: [{ id: 'w0', start: [0, 0], end: [500, 0] }],
+          walls: [
+            { id: 'w0', start: [0, 0], end: [500, 0], wall_type: 'external', thickness_mm: 200 },
+          ],
           rooms: [{ id: 'office', type: 'OFFICE', boundary: [[0, 0], [50, 0], [50, 50], [0, 50]] }],
           room_graph: { nodes: [], edges: [] },
         },
@@ -245,6 +273,17 @@ test('a non-approving Qwen advisory never strips the deterministic geometry', as
   // Qwen rides along as a separate advisory input, not a gate.
   assert.equal(context.plan.visionAdvisory.status, 'insufficient');
   assert.equal(context.plan.visionAdvisory.spaces[0].label, 'Office');
+  // Regression: the actual wall segments must reach the model, not just a
+  // count — a plan with real traced walls previously still read as "no wall
+  // geometry" because plan.walls was never included in the payload at all.
+  assert.equal(context.plan.walls.length, 1);
+  assert.deepEqual(context.plan.walls[0].start, [0, 0]);
+  assert.deepEqual(context.plan.walls[0].end, [500, 0]);
+  // Qwen's openings read substitutes for the (often-disabled) deterministic
+  // door/window detector, with counts precomputed rather than left for the
+  // model to tally from a raw array.
+  assert.equal(context.plan.visionOpenings.doorCount, 1);
+  assert.equal(context.plan.visionOpenings.windowCount, 1);
   const body = await response.clone().json();
   assert.equal(body.compliance.scoreBasis, 'verified_geometry');
 });
