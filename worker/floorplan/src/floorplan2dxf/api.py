@@ -165,7 +165,17 @@ def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) 
             if isinstance(item, dict)
         ],
         "openings": [
-            {"type": str(item.get("type", ""))[:20], "center": item.get("center")}
+            {
+                "type": str(item.get("type", ""))[:20],
+                "center": item.get("center"),
+                # What the opening attaches to — an egress door between a room
+                # and OUTSIDE is materially different from an internal door, and
+                # counts alone can't express that.
+                "connects": [
+                    str(name)[:80] for name in list(item.get("connects") or [])[:2]
+                ],
+                "isExternal": bool(item.get("is_external")),
+            }
             for item in list(spec.get("openings") or [])[:80]
             if isinstance(item, dict)
         ],

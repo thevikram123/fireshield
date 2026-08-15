@@ -28,6 +28,66 @@ const MAX_JSON_BYTES = 48_000;
 const MAX_VISION_BYTES = 22 * 1024 * 1024; // 5 images * ~4MB + JSON overhead
 const MAX_TOOL_HOPS = 4;
 const PLAN_MAX_TOOL_HOPS = 3;
+// Groq's free-tier TPM counts input tokens PLUS max_completion_tokens against
+// the same 8000/min budget, so a single request can be rejected outright with
+// 413 "Request too large" — no waiting or model-switching can rescue it, the
+// payload itself must fit. The tool-calling loop is what blew past this: each
+// hop appends an assistant message plus tool results, so by the final call the
+// accumulated history plus the reserved completion budget exceeded 8000.
+const GROQ_TPM_BUDGET = 7200; // headroom under the hard 8000 cap
+const PLAN_FINAL_MAX_TOKENS = 1400;
+const REASON_HOP_MAX_TOKENS = 700;
+const REASON_FINAL_MAX_TOKENS = 1600;
+const TOOL_RESULT_MAX_CHARS = 1500;
+
+// Groq bills whole tokens; ~4 chars/token is the standard rough estimate and
+// only needs to be conservative enough to keep us under the cap.
+function estimateTokens(text) {
+  return Math.ceil(String(text || '').length / 4);
+}
+
+function messageTokens(message) {
+  return estimateTokens(message?.content || '')
+    + estimateTokens(JSON.stringify(message?.tool_calls || ''))
+    + 4; // per-message role/format overhead
+}
+
+/// Shrink an accumulated tool-calling conversation to fit `maxInputTokens`.
+/// Message STRUCTURE is preserved (never drop an assistant message carrying
+/// tool_calls, or its matching tool replies — orphaned tool_call_ids are a
+/// hard API error). Instead the oldest tool results, which are bulky NBC
+/// lookups already reflected in later reasoning, get truncated first.
+function fitMessagesToTokenBudget(messages, maxInputTokens) {
+  const fitted = messages.map((message) => ({ ...message }));
+  const total = () => fitted.reduce((sum, message) => sum + messageTokens(message), 0);
+  if (total() <= maxInputTokens) return fitted;
+
+  // Pass 1: truncate tool results oldest-first, leaving a marker so the model
+  // knows the lookup happened rather than silently seeing nothing.
+  for (let i = 0; i < fitted.length && total() > maxInputTokens; i++) {
+    if (fitted[i].role !== 'tool') continue;
+    const budgetChars = 400;
+    if ((fitted[i].content || '').length > budgetChars) {
+      fitted[i].content = `${fitted[i].content.slice(0, budgetChars)} …[truncated to fit token budget]`;
+    }
+  }
+  // Pass 2: still too big — drop the bulk of older tool payloads entirely,
+  // keeping the message (and its tool_call_id) so pairing stays valid.
+  for (let i = 0; i < fitted.length && total() > maxInputTokens; i++) {
+    if (fitted[i].role !== 'tool') continue;
+    fitted[i].content = '[earlier NBCS lookup omitted to fit the token budget]';
+  }
+  // Pass 3: the evidence context itself is the last thing to shrink.
+  if (total() > maxInputTokens) {
+    const contextIndex = fitted.findIndex((message) => message.role === 'user');
+    if (contextIndex >= 0) {
+      const overBy = (total() - maxInputTokens) * 4;
+      const content = fitted[contextIndex].content || '';
+      fitted[contextIndex].content = content.slice(0, Math.max(1200, content.length - overBy - 200));
+    }
+  }
+  return fitted;
+}
 const NBC_QUERY_TOOL = {
   type: 'function',
   function: {
@@ -218,7 +278,7 @@ async function assessFloorplan(converted, env, apiKey) {
       env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, 900);
     const data = await callGroq(apiKey, {
       model: hopModel,
-      messages,
+      messages: fitMessagesToTokenBudget(messages, GROQ_TPM_BUDGET - 900),
       tools: [NBC_QUERY_TOOL],
       tool_choice: 'auto',
       temperature: 0.2,
@@ -253,23 +313,41 @@ async function assessFloorplan(converted, env, apiKey) {
   }
 
   // Prefer 120b for the actual verdict; switch to 20b only if 120b's pool is
-  // the one currently tight. If 20b turns out not to support strict schema
-  // mode either, this is no worse than today — the call still errors and
-  // degrades to the existing partial-response path below.
-  const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, 1600);
-  const finalData = await callGroq(apiKey, {
-    model: finalModel,
-    messages: [...messages, {
+  // the one currently tight. Both models support JSON Schema Mode and tool
+  // use (per their Groq model pages), so either can serve any step here.
+  const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, PLAN_FINAL_MAX_TOKENS);
+  const finalMessages = fitMessagesToTokenBudget(
+    [...messages, {
       role: 'user',
       content: 'Now output the final compliance assessment as JSON only, matching the schema.',
     }],
+    GROQ_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS,
+  );
+  const finalPayload = {
+    model: finalModel,
+    messages: finalMessages,
     tool_choice: 'none',
     temperature: 0.2,
-    max_completion_tokens: 1600,
+    max_completion_tokens: PLAN_FINAL_MAX_TOKENS,
     reasoning_effort: 'low',
     include_reasoning: false,
     response_format: PLAN_RESPONSE_FORMAT,
-  });
+  };
+  let finalData = await callGroq(apiKey, finalPayload);
+  // One reinforced retry on a schema-validation miss, mirroring the vision
+  // path. Without this a single malformed generation discarded an otherwise
+  // complete assessment and surfaced as "provider did not return an assessment".
+  if (finalData.error && finalData.code === 'json_validate_failed') {
+    finalData = await callGroq(apiKey, {
+      ...finalPayload,
+      messages: [...finalMessages, {
+        role: 'user',
+        content: 'Your previous reply failed schema validation. Return exactly one JSON object '
+          + 'matching the schema. Use null (not a missing field) for clauseId or page when a '
+          + 'finding has no clause to cite, and include every required field.',
+      }],
+    });
+  }
   if (finalData.error) return finalData;
   const value = safeJson(finalData.json?.choices?.[0]?.message?.content);
   if (!value || !Array.isArray(value.findings)) {
@@ -281,6 +359,22 @@ async function assessFloorplan(converted, env, apiKey) {
 }
 
 function finalisePlanAssessment(value, plan) {
+  // clauseId/page are nullable in the schema (a cannot_verify finding has no
+  // clause to cite). Normalise to '' here so the app and stored history keep
+  // seeing plain strings.
+  if (Array.isArray(value.findings)) {
+    value.findings = value.findings.map((finding) => ({
+      ...finding,
+      clauseId: finding?.clauseId ?? '',
+    }));
+  }
+  if (Array.isArray(value.citedClauses)) {
+    value.citedClauses = value.citedClauses.map((clause) => ({
+      ...clause,
+      id: clause?.id ?? '',
+      title: clause?.title ?? '',
+    }));
+  }
   const findings = Array.isArray(value.findings) ? value.findings : [];
   const severityWeight = { minor: 1, major: 2, critical: 3 };
   const statusScore = { compliant: 100, gap: 35, critical_gap: 0, cannot_verify: 50 };
@@ -493,10 +587,21 @@ function compactPlanForReasoning(converted) {
     visionOpenings: (() => {
       const items = (Array.isArray(advisory.openings) ? advisory.openings : [])
         .slice(0, 80)
-        .map((item) => ({ type: String(item?.type || '').slice(0, 20), center: point(item?.center) }));
+        .map((item) => ({
+          type: String(item?.type || '').slice(0, 20),
+          center: point(item?.center),
+          // Which spaces the opening joins, and whether it reaches outdoors.
+          // An external door is an egress point; an internal one is not, and
+          // a bare count cannot distinguish them.
+          connects: Array.isArray(item?.connects)
+            ? item.connects.slice(0, 2).map((name) => String(name).slice(0, 80)) : [],
+          isExternal: item?.isExternal === true,
+        }));
+      const doors = items.filter((item) => item.type === 'door');
       return {
-        doorCount: items.filter((item) => item.type === 'door').length,
+        doorCount: doors.length,
         windowCount: items.filter((item) => item.type === 'window').length,
+        externalDoorCount: doors.filter((item) => item.isExternal).length,
         items,
       };
     })(),
@@ -698,14 +803,14 @@ async function groqReason(request, env, cors, apiKey) {
   // headroom right now, rather than blindly retrying the one that's tight.
   for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
     const hopModel = pickAvailableModel(
-      env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, 1500);
+      env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, REASON_HOP_MAX_TOKENS);
     const data = await callGroq(apiKey, {
       model: hopModel,
-      messages,
+      messages: fitMessagesToTokenBudget(messages, GROQ_TPM_BUDGET - REASON_HOP_MAX_TOKENS),
       tools: [NBC_QUERY_TOOL],
       tool_choice: 'auto',
       temperature: 0.3,
-      max_completion_tokens: 1500,
+      max_completion_tokens: REASON_HOP_MAX_TOKENS,
       include_reasoning: false,
     });
     if (data.error) {
@@ -734,7 +839,7 @@ async function groqReason(request, env, cors, apiKey) {
       messages.push({
         role: 'tool',
         tool_call_id: call.id,
-        content: JSON.stringify(result).slice(0, 6000),
+        content: JSON.stringify(result).slice(0, TOOL_RESULT_MAX_CHARS),
       });
     }
   }
@@ -744,13 +849,17 @@ async function groqReason(request, env, cors, apiKey) {
   // preferred model — but if 120b's pool is the one currently tight and 20b
   // has room, switch automatically rather than fail a request 20b could
   // still answer (degraded, but real, beats a hard 429 mid-demo).
-  const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, 2000);
+  const finalModel = pickAvailableModel(
+    env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, REASON_FINAL_MAX_TOKENS);
   const finalData = await callGroq(apiKey, {
     model: finalModel,
-    messages: [...messages, { role: 'user', content: FINAL_INSTRUCTION }],
+    messages: fitMessagesToTokenBudget(
+      [...messages, { role: 'user', content: FINAL_INSTRUCTION }],
+      GROQ_TPM_BUDGET - REASON_FINAL_MAX_TOKENS,
+    ),
     tool_choice: 'none',
     temperature: 0.2,
-    max_completion_tokens: 2000,
+    max_completion_tokens: REASON_FINAL_MAX_TOKENS,
     include_reasoning: false,
     response_format: { type: 'json_object' },
   });
@@ -866,6 +975,19 @@ async function callGroq(apiKey, payload, { retriedAfterRateLimit = false } = {})
         return callGroq(apiKey, payload, { retriedAfterRateLimit: true });
       }
     }
+    // 413 "Request too large" is NOT a wait-and-retry condition — the payload
+    // exceeds the whole per-minute budget, so waiting changes nothing. Retry
+    // once with the history aggressively compacted and a smaller completion
+    // reservation, which is the only thing that can actually make it fit.
+    if (upstream.status === 413 && !retriedAfterRateLimit && Array.isArray(payload.messages)) {
+      const shrunkCompletion = Math.max(600, Math.floor((payload.max_completion_tokens || 1200) / 2));
+      const shrunk = {
+        ...payload,
+        max_completion_tokens: shrunkCompletion,
+        messages: fitMessagesToTokenBudget(payload.messages, Math.floor(GROQ_TPM_BUDGET / 2)),
+      };
+      return callGroq(apiKey, shrunk, { retriedAfterRateLimit: true });
+    }
     // Server-log only diagnostic: never returned to the client. Helps debug
     // json_validate_failed (Groq includes the model's raw non-JSON output here).
     console.error(JSON.stringify({ message: 'Groq call failed', status: upstream.status, model: payload.model, code }));
@@ -944,11 +1066,14 @@ const PLAN_REASON_SYSTEM =
   + 'visible safety features; it is advisory and never overrides or invalidates the geometry. '
   + '`plan.doors`/`plan.windows` come from a deterministic door/window detector that is often disabled — they '
   + 'may legitimately be empty even when doors/windows are visibly present in the drawing. In that case, use '
-  + '`plan.visionOpenings` (Qwen\'s read, {doorCount, windowCount, items:[{type,center}]}) as the egress evidence '
-  + 'instead of treating an empty plan.doors/windows as proof none exist. Because it is advisory, still mark '
-  + 'absolute door/window widths as cannot_verify unless plan.doors/windows independently confirms a measured '
-  + 'width — but use visionOpenings.doorCount/windowCount for exit COUNT and presence so those checks are not '
-  + 'marked cannot_verify for no reason. '
+  + '`plan.visionOpenings` (Qwen\'s read: {doorCount, windowCount, externalDoorCount, '
+  + 'items:[{type,center,connects,isExternal}]}) as the egress evidence instead of treating an empty '
+  + 'plan.doors/windows as proof none exist. `connects` names the spaces each opening joins and `isExternal` '
+  + 'marks the ones leading outdoors, so use externalDoorCount and the connects graph to assess exit count, '
+  + 'exit separation/remoteness, and whether any space is a dead end with only one way out. Because it is '
+  + 'advisory, still mark absolute door/window WIDTHS as cannot_verify unless plan.doors/windows independently '
+  + 'confirms a measured width — but exit count, presence and connectivity must be assessed from visionOpenings '
+  + 'rather than marked cannot_verify for no reason. '
   + 'Identify which fire-safety systems and life-safety checks this specific geometry implicates (exit count and '
   + 'width, travel distance, corridor width, compartmentation, detection/sprinkler coverage, refuge area, etc.), '
   + 'then use the query_nbc tool to fetch the exact NBCS requirement for each — including a specific measured '
@@ -993,7 +1118,13 @@ const PLAN_RESPONSE_FORMAT = {
               observed: { type: 'string' },
               required: { type: 'string' },
               measurementEvidence: { type: 'string' },
-              clauseId: { type: 'string' },
+              // A cannot_verify finding legitimately has no clause to cite, and
+              // the model emits null for it. Declaring this non-nullable made a
+              // single such finding fail the WHOLE assessment with
+              // json_validate_failed. Groq's structured-output docs prescribe
+              // union-with-null for exactly this; nulls are normalised to ''
+              // in finalisePlanAssessment so downstream shape is unchanged.
+              clauseId: { type: ['string', 'null'] },
               page: { type: ['number', 'null'] },
               rationale: { type: 'string' },
             },
@@ -1009,7 +1140,10 @@ const PLAN_RESPONSE_FORMAT = {
             type: 'object',
             additionalProperties: false,
             properties: {
-              id: { type: 'string' }, title: { type: 'string' }, page: { type: 'number' },
+              id: { type: 'string' },
+              title: { type: 'string' },
+              // Same nullability trap as clauseId: a cited entry can lack a page.
+              page: { type: ['number', 'null'] },
             },
             required: ['id', 'title', 'page'],
           },
@@ -1126,4 +1260,6 @@ function json(value, status, headers = {}) {
 // exported by reference so tests can seed/clear it directly without going
 // through the full HTTP+mock-fetch machinery (and without leaking state into
 // unrelated tests in the same process).
-export const __testing__ = { pickAvailableModel, groqQuota };
+export const __testing__ = {
+  pickAvailableModel, groqQuota, fitMessagesToTokenBudget, estimateTokens,
+};

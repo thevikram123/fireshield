@@ -72,6 +72,74 @@ test('the model picker switches to whichever pool actually has headroom', (t) =>
   assert.equal(pickAvailableModel(LIGHT, HEAVY, 900), LIGHT);
 });
 
+test('the token trimmer shrinks history without orphaning tool_call pairings', () => {
+  const { fitMessagesToTokenBudget, estimateTokens } = __testing__;
+  // A realistic blown-up tool loop: big context + several bulky NBC lookups.
+  const messages = [
+    { role: 'system', content: 'S'.repeat(400) },
+    { role: 'user', content: 'C'.repeat(10_000) },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'query_nbc', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_1', content: 'R'.repeat(6000) },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'call_2', function: { name: 'query_nbc', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_2', content: 'R'.repeat(6000) },
+    { role: 'user', content: 'Now output the final assessment.' },
+  ];
+  const budget = 2000;
+  const before = messages.reduce((n, m) => n + estimateTokens(m.content), 0);
+  assert.ok(before > budget, 'fixture must actually exceed the budget');
+
+  const fitted = fitMessagesToTokenBudget(messages, budget);
+  const after = fitted.reduce((n, m) => n + estimateTokens(m.content), 0);
+  assert.ok(after <= budget, `expected <= ${budget} tokens, got ${after}`);
+
+  // Structure must survive: every tool message keeps its id, and every
+  // tool_call issued by an assistant still has a matching tool reply.
+  // Orphaned tool_call_ids are a hard Groq API error, so this is the
+  // property that matters more than the exact byte savings.
+  assert.equal(fitted.length, messages.length);
+  const calledIds = fitted.flatMap((m) => (m.tool_calls || []).map((c) => c.id));
+  const repliedIds = fitted.filter((m) => m.role === 'tool').map((m) => m.tool_call_id);
+  assert.deepEqual(calledIds.sort(), repliedIds.sort());
+  // The system prompt is never sacrificed.
+  assert.equal(fitted[0].content, messages[0].content);
+});
+
+test('an under-budget conversation is passed through untouched', () => {
+  const { fitMessagesToTokenBudget } = __testing__;
+  const messages = [
+    { role: 'system', content: 'short system' },
+    { role: 'user', content: 'short context' },
+  ];
+  assert.deepEqual(fitMessagesToTokenBudget(messages, 5000), messages);
+});
+
+test('a Groq 413 retries with a compacted payload instead of waiting', async (t) => {
+  const seen = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const payload = JSON.parse(options.body);
+    seen.push(payload);
+    if (seen.length === 1) {
+      // 413 carries no usable Retry-After — waiting can never fix it.
+      return new Response(JSON.stringify({
+        error: { code: 'rate_limit_exceeded', message: 'Request too large ... Limit 8000, Requested 8849' },
+      }), { status: 413, headers: {} });
+    }
+    return Response.json({ choices: [{ message: { content: 'ok after shrink' } }] });
+  });
+  // groqChat caps each message at 6000 chars, so use enough messages that the
+  // payload genuinely exceeds the compaction budget — otherwise the trimmer
+  // correctly passes it through and the test proves nothing.
+  const bulky = Array.from({ length: 8 }, () => ({ role: 'user', content: 'x'.repeat(6000) }));
+  const response = await worker.fetch(post('/groq/chat', { messages: bulky }), env());
+  assert.equal(response.status, 200);
+  assert.equal(seen.length, 2, 'should retry exactly once');
+  // The retry must actually be smaller, not a blind repeat of the same request.
+  const firstChars = JSON.stringify(seen[0].messages).length;
+  const retryChars = JSON.stringify(seen[1].messages).length;
+  assert.ok(retryChars < firstChars, `retry must shrink (${retryChars} !< ${firstChars})`);
+  assert.ok(seen[1].max_completion_tokens < seen[0].max_completion_tokens);
+});
+
 test('rate-limit headers are exposed cross-origin so the client can read them', async () => {
   // Custom response headers are invisible to browser JS on a cross-origin
   // fetch unless the server explicitly exposes them via CORS. Without this,
