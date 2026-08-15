@@ -187,10 +187,13 @@ async function convertFloorplan(request, env, cors, groqKey) {
         findings: [],
         citedClauses: [],
         limitations: [compliance.error],
+        // Client can dynamically self-throttle its retry using Groq's own
+        // cooldown instead of a fixed guess.
+        retryAfterSeconds: compliance.retryAfterSeconds ?? null,
       },
     }, 200, { ...cors, ...compliance.headers });
   }
-  return json({ ...converted, compliance: compliance.value }, 200, cors);
+  return json({ ...converted, compliance: compliance.value }, 200, { ...cors, ...compliance.headers });
 }
 
 async function assessFloorplan(converted, env, apiKey) {
@@ -264,7 +267,9 @@ async function assessFloorplan(converted, env, apiKey) {
   if (!value || !Array.isArray(value.findings)) {
     return { error: 'GPT-OSS returned an invalid plan assessment', status: 502, headers: {} };
   }
-  return { value: finalisePlanAssessment(value, plan) };
+  // Forward gpt-oss-120b's own remaining-quota numbers so the client can pace
+  // its *next* Groq-dependent call instead of guessing a fixed delay.
+  return { value: finalisePlanAssessment(value, plan), headers: finalData.headers };
 }
 
 function finalisePlanAssessment(value, plan) {
@@ -540,8 +545,11 @@ async function groqChat(request, env, cors, apiKey) {
     max_completion_tokens: 1024,
     include_reasoning: false,
   });
-  if (data.error) return json({ error: data.error }, data.status, { ...cors, ...data.headers });
-  return json({ content: data.json?.choices?.[0]?.message?.content || '' }, 200, cors);
+  if (data.error) {
+    return json({ error: data.error, retryAfterSeconds: data.retryAfterSeconds ?? null },
+      data.status, { ...cors, ...data.headers });
+  }
+  return json({ content: data.json?.choices?.[0]?.message?.content || '' }, 200, { ...cors, ...data.headers });
 }
 
 // ── Groq: vision (equipment / scene detection) ───────────────────────────────
@@ -601,9 +609,12 @@ async function groqVision(request, env, cors, apiKey) {
       ],
     });
   }
-  if (data.error) return json({ error: data.error }, data.status, { ...cors, ...data.headers });
+  if (data.error) {
+    return json({ error: data.error, retryAfterSeconds: data.retryAfterSeconds ?? null },
+      data.status, { ...cors, ...data.headers });
+  }
   const parsed = safeJson(data.json?.choices?.[0]?.message?.content);
-  return json({ detections: parsed?.detections ?? parsed ?? [] }, 200, cors);
+  return json({ detections: parsed?.detections ?? parsed ?? [] }, 200, { ...cors, ...data.headers });
 }
 
 // ── Groq: compliance reasoning with live NBC graph tool ──────────────────────
@@ -650,7 +661,10 @@ async function groqReason(request, env, cors, apiKey) {
       max_completion_tokens: 1500,
       include_reasoning: false,
     });
-    if (data.error) return json({ error: data.error }, data.status, { ...cors, ...data.headers });
+    if (data.error) {
+      return json({ error: data.error, retryAfterSeconds: data.retryAfterSeconds ?? null },
+        data.status, { ...cors, ...data.headers });
+    }
 
     const msg = data.json?.choices?.[0]?.message;
     if (!msg) return json({ error: 'empty model response' }, 502, cors);
@@ -688,9 +702,12 @@ async function groqReason(request, env, cors, apiKey) {
     include_reasoning: false,
     response_format: { type: 'json_object' },
   });
-  if (finalData.error) return json({ error: finalData.error }, finalData.status, { ...cors, ...finalData.headers });
+  if (finalData.error) {
+    return json({ error: finalData.error, retryAfterSeconds: finalData.retryAfterSeconds ?? null },
+      finalData.status, { ...cors, ...finalData.headers });
+  }
   const verdict = safeJson(finalData.json?.choices?.[0]?.message?.content) || {};
-  return json(verdict, 200, cors);
+  return json(verdict, 200, { ...cors, ...finalData.headers });
 }
 
 // ── Direct graph query (debug / Regulations phase) ───────────────────────────
@@ -751,10 +768,14 @@ async function callGroq(apiKey, payload, { retriedAfterRateLimit = false } = {})
       error: `Groq call failed (${upstream.status})${providerDetail ? `: ${providerDetail}` : ''}`,
       status: upstream.status,
       code,
+      retryAfterSeconds: parseFloat(upstream.headers.get('retry-after') || '0') || null,
       headers: groqRateLimitHeaders(upstream.headers),
     };
   }
-  return { json: body };
+  // Forward quota headers on success too (not just on 429). This is what lets
+  // the client self-throttle its *next* call using Groq's own numbers —
+  // x-ratelimit-remaining-tokens / -reset-tokens — instead of a fixed guess.
+  return { json: body, headers: groqRateLimitHeaders(upstream.headers) };
 }
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
@@ -963,6 +984,13 @@ function corsHeaders(origin, env) {
   const headers = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // Custom response headers are invisible to browser JS on a cross-origin
+    // call unless explicitly exposed. Without this, the Dart client's dynamic
+    // rate-limit self-throttling silently sees no headers at all.
+    'Access-Control-Expose-Headers':
+      'Retry-After, X-RateLimit-Limit-Requests, X-RateLimit-Limit-Tokens, '
+      + 'X-RateLimit-Remaining-Requests, X-RateLimit-Remaining-Tokens, '
+      + 'X-RateLimit-Reset-Requests, X-RateLimit-Reset-Tokens',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
     'X-Content-Type-Options': 'nosniff',

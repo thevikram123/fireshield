@@ -47,6 +47,20 @@ test('health reports model, index, secret, and limiter bindings', async () => {
   assert.equal(body.floorplanConfigured, true);
 });
 
+test('rate-limit headers are exposed cross-origin so the client can read them', async () => {
+  // Custom response headers are invisible to browser JS on a cross-origin
+  // fetch unless the server explicitly exposes them via CORS. Without this,
+  // the Dart client's dynamic self-throttling silently sees nothing.
+  const response = await worker.fetch(
+    new Request('https://worker.test/health', { headers: { Origin: origin } }),
+    env(),
+  );
+  const exposed = response.headers.get('access-control-expose-headers') || '';
+  assert.match(exposed, /Retry-After/i);
+  assert.match(exposed, /X-RateLimit-Remaining-Tokens/i);
+  assert.match(exposed, /X-RateLimit-Reset-Tokens/i);
+});
+
 test('floorplan conversion fails closed when its limiter is missing', async () => {
   const form = new FormData();
   form.append('file', new Blob(['plan'], { type: 'image/png' }), 'plan.png');

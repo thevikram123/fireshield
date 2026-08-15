@@ -22,6 +22,54 @@ class FsServiceException implements Exception {
   String toString() => 'FsServiceException($status): $message';
 }
 
+/// Tracks Groq's own quota state for one model, from its response headers
+/// (x-ratelimit-remaining-tokens / -reset-tokens, Retry-After). Nothing here
+/// is hardcoded — every wait is derived from whatever Groq returned last.
+class _RateWindow {
+  int? remainingTokens;
+  DateTime? resetAt;
+
+  void observe(Map<String, String> headers) {
+    final remaining = int.tryParse(headers['x-ratelimit-remaining-tokens'] ?? '');
+    if (remaining != null) remainingTokens = remaining;
+    final resetHeader = headers['x-ratelimit-reset-tokens'];
+    final resetSeconds = _parseGroqDuration(resetHeader);
+    if (resetSeconds != null) {
+      resetAt = DateTime.now().add(Duration(milliseconds: (resetSeconds * 1000).round()));
+    }
+  }
+
+  /// How long to wait before firing the next call of roughly [estimatedTokens]
+  /// size, given what Groq last reported. Zero if there's no reason to wait.
+  Duration waitBefore(int estimatedTokens) {
+    final reset = resetAt;
+    if (reset == null) return Duration.zero;
+    final remaining = remainingTokens;
+    if (remaining != null && remaining >= estimatedTokens) return Duration.zero;
+    final until = reset.difference(DateTime.now());
+    return until.isNegative ? Duration.zero : until;
+  }
+}
+
+/// Parses Groq's rate-limit duration headers, e.g. "7.66s", "1m0.5s", "12ms".
+double? _parseGroqDuration(String? raw) {
+  if (raw == null || raw.isEmpty) return null;
+  final match = RegExp(r'^(?:(\d+)m)?(\d+(?:\.\d+)?)(m?s)$').firstMatch(raw.trim());
+  if (match == null) return double.tryParse(raw);
+  final minutes = double.tryParse(match.group(1) ?? '0') ?? 0;
+  final value = double.tryParse(match.group(2) ?? '0') ?? 0;
+  final unit = match.group(3);
+  final seconds = unit == 'ms' ? value / 1000 : value;
+  return minutes * 60 + seconds;
+}
+
+class _RawResponse {
+  final int status;
+  final Map<String, dynamic>? decoded;
+  final Map<String, String> headers;
+  const _RawResponse({required this.status, required this.decoded, required this.headers});
+}
+
 class FsGroqService {
   FsGroqService({http.Client? client, String? baseUrl})
       : _client = client ?? http.Client(),
@@ -29,19 +77,54 @@ class FsGroqService {
 
   final http.Client _client;
   final String _base;
+  final Map<String, _RateWindow> _rateWindows = {};
 
   static const _timeout = Duration(seconds: 60);
+  static const _maxDynamicWait = Duration(seconds: 45);
 
   bool get isConfigured => _base.isNotEmpty;
 
   Uri _uri(String path) => Uri.parse('$_base$path');
 
+  /// [rateKey] groups calls that share a Groq quota (roughly: the path/model)
+  /// so a wait derived from one call's headers applies to the next same-kind
+  /// call, not unrelated ones. [estimatedTokens] is only used to decide
+  /// whether it's worth waiting at all — never to hardcode the wait itself.
   Future<Map<String, dynamic>> _post(
-      String path, Map<String, dynamic> body) async {
+    String path,
+    Map<String, dynamic> body, {
+    String? rateKey,
+    int estimatedTokens = 1500,
+  }) async {
     if (!isConfigured) {
       throw const FsServiceException(
           'AI service not configured — set FIRESHIELD_WORKER_URL at build time.');
     }
+    final key = rateKey ?? path;
+    final window = _rateWindows.putIfAbsent(key, () => _RateWindow());
+    final wait = window.waitBefore(estimatedTokens);
+    if (wait > Duration.zero) {
+      await Future.delayed(wait < _maxDynamicWait ? wait : _maxDynamicWait);
+    }
+
+    final result = await _postOnce(path, body);
+    window.observe(result.headers);
+    if (result.decoded?['error'] != null) {
+      final retryAfter = (result.decoded?['retryAfterSeconds'] as num?)?.toDouble();
+      if (retryAfter != null && retryAfter > 0 &&
+          Duration(milliseconds: (retryAfter * 1000).round()) <= _maxDynamicWait) {
+        // One dynamic, header-driven retry — mirrors the Worker's own backoff
+        // so a same-window collision doesn't surface as a hard failure here.
+        await Future.delayed(Duration(milliseconds: (retryAfter * 1000).round()));
+        final retried = await _postOnce(path, body);
+        window.observe(retried.headers);
+        return _unwrap(retried);
+      }
+    }
+    return _unwrap(result);
+  }
+
+  Future<_RawResponse> _postOnce(String path, Map<String, dynamic> body) async {
     http.Response res;
     try {
       final headers = <String, String>{'Content-Type': 'application/json'};
@@ -63,15 +146,18 @@ class FsGroqService {
     } catch (_) {
       decoded = null;
     }
-    if (res.statusCode >= 400 || decoded == null) {
-      final msg = decoded?['error']?.toString() ?? 'request failed';
-      throw FsServiceException(msg, status: res.statusCode);
+    return _RawResponse(status: res.statusCode, decoded: decoded, headers: res.headers);
+  }
+
+  Map<String, dynamic> _unwrap(_RawResponse res) {
+    if (res.status >= 400 || res.decoded == null) {
+      final msg = res.decoded?['error']?.toString() ?? 'request failed';
+      throw FsServiceException(msg, status: res.status);
     }
-    if (decoded['error'] != null) {
-      throw FsServiceException(decoded['error'].toString(),
-          status: res.statusCode);
+    if (res.decoded!['error'] != null) {
+      throw FsServiceException(res.decoded!['error'].toString(), status: res.status);
     }
-    return decoded;
+    return res.decoded!;
   }
 
   /// Grounded chat through the Worker. The Worker adds relevant NBCS 2026
@@ -123,12 +209,20 @@ class FsGroqService {
     List<String> docs = const [],
     Map<String, dynamic> evidenceContext = const {},
   }) async {
-    final res = await _post('/groq/reason', {
-      'buildingProfile': buildingProfile,
-      'detected': detected.map((d) => d.toJson()).toList(),
-      'docs': docs,
-      'evidenceContext': evidenceContext,
-    });
+    final res = await _post(
+      '/groq/reason',
+      {
+        'buildingProfile': buildingProfile,
+        'detected': detected.map((d) => d.toJson()).toList(),
+        'docs': docs,
+        'evidenceContext': evidenceContext,
+      },
+      // Shares the org's gpt-oss-120b TPM budget with floor-plan compliance
+      // (fs_plan_service.dart) — same rate key so a wait learned from one
+      // paces the other instead of both firing into the same 429.
+      rateKey: 'gpt-oss-120b',
+      estimatedTokens: 3000,
+    );
     return FsAuditRun.fromVerdict(
       res,
       occupancyGroup: occupancyGroup,
