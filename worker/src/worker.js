@@ -325,29 +325,45 @@ async function assessFloorplan(converted, env, apiKey) {
     { role: 'system', content: PLAN_REASON_SYSTEM },
     { role: 'user', content: fitPlanReasoningContext(plan, []) },
   ];
+  const mistralKey = env.MISTRAL_API_KEY ? await readSecret(env.MISTRAL_API_KEY) : '';
 
-  // Same split as groqReason: tool-selection hops prefer gpt-oss-20b (its own
-  // TPM pool) so they don't eat into the 8000 TPM/min budget the final
-  // gpt-oss-120b verdict call below needs. Re-picked every hop so a currently
-  // tight 20b pool (e.g. from a concurrent site/photo audit hop) doesn't get
-  // blindly retried — it automatically switches to whichever model has room.
+  // Tool-calling loop, Mistral primary (function-calling confirmed compatible
+  // with Groq's tools/tool_choice/tool_calls shape) — Groq fallback for when
+  // Mistral itself is briefly down. A hop failing on BOTH providers degrades
+  // (proceeds to the final verdict with whatever was found so far) rather
+  // than failing the whole plan assessment, same reasoning as groqReason's
+  // hop loop: a tight lookup step must not block the audit outright.
   for (let hop = 0; hop < PLAN_MAX_TOOL_HOPS; hop++) {
-    const hopModel = pickAvailableModel(
-      env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, 900);
-    const data = await callGroq(apiKey, {
-      model: hopModel,
-      messages: fitMessagesToTokenBudget(messages, GROQ_TPM_BUDGET - 900),
-      tools: [NBC_QUERY_TOOL],
-      tool_choice: 'auto',
-      temperature: 0.2,
-      max_completion_tokens: 900,
-      reasoning_effort: 'low',
-      include_reasoning: false,
-    });
-    if (data.error) return data;
+    let data = null;
+    if (mistralKey) {
+      data = await callMistral(mistralKey, {
+        model: 'mistral-medium-latest',
+        messages: fitMessagesToTokenBudget(messages, MISTRAL_TPM_BUDGET - 900),
+        tools: [NBC_QUERY_TOOL],
+        tool_choice: 'auto',
+        temperature: 0.2,
+        max_completion_tokens: 900,
+        include_reasoning: false,
+      });
+    }
+    if (!data || data.error) {
+      const hopModel = pickAvailableModel(
+        env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, 900);
+      data = await callGroq(apiKey, {
+        model: hopModel,
+        messages: fitMessagesToTokenBudget(messages, GROQ_TPM_BUDGET - 900),
+        tools: [NBC_QUERY_TOOL],
+        tool_choice: 'auto',
+        temperature: 0.2,
+        max_completion_tokens: 900,
+        reasoning_effort: 'low',
+        include_reasoning: false,
+      });
+    }
+    if (data.error) break;
 
     const msg = data.json?.choices?.[0]?.message;
-    if (!msg) return { error: 'GPT-OSS returned an empty response', status: 502, headers: {} };
+    if (!msg) break;
     messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) break;
@@ -370,58 +386,95 @@ async function assessFloorplan(converted, env, apiKey) {
     }
   }
 
-  // Prefer 120b for the actual verdict; switch to 20b only if 120b's pool is
-  // the one currently tight. Both models support JSON Schema Mode and tool
-  // use (per their Groq model pages), so either can serve any step here.
-  const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, PLAN_FINAL_MAX_TOKENS);
   const { base: planBase, summary: planFindings } = summariseToolLoop(messages);
-  const finalMessages = fitMessagesToTokenBudget(
-    [
-      ...planBase,
-      {
-        role: 'user',
-        content: (planFindings ? `NBCS lookup results:\n${planFindings}\n\n` : '')
-          + 'Now output the final compliance assessment as JSON only, matching the schema.',
-      },
-    ],
-    GROQ_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS,
-  );
-  const finalPayload = {
-    model: finalModel,
-    messages: finalMessages,
-    tool_choice: 'none',
-    temperature: 0.2,
-    max_completion_tokens: PLAN_FINAL_MAX_TOKENS,
-    reasoning_effort: 'low',
-    include_reasoning: false,
-    response_format: PLAN_RESPONSE_FORMAT,
-  };
-  let finalData = await callGroq(apiKey, finalPayload);
-  // One reinforced retry on a schema-validation miss, mirroring the vision
-  // path. Without this a single malformed generation discarded an otherwise
-  // complete assessment and surfaced as "provider did not return an assessment".
-  if (finalData.error && finalData.code === 'json_validate_failed') {
-    // The usual cause is the generation being cut off mid-object, so the retry
-    // both asks for a compact answer and raises the completion room rather than
-    // repeating the same budget that truncated.
-    finalData = await callGroq(apiKey, {
-      ...finalPayload,
-      max_completion_tokens: PLAN_FINAL_MAX_TOKENS + 400,
-      messages: [...finalMessages, {
-        role: 'user',
-        content: 'Your previous reply failed schema validation, most likely because it was cut '
-          + 'off. Return exactly one COMPLETE JSON object with every required field present. '
-          + 'Keep it compact: at most six findings and short rationales. Use null (not a missing '
-          + 'field) for clauseId or page when a finding has no clause to cite.',
-      }],
+  const rawFinalMessages = [
+    ...planBase,
+    {
+      role: 'user',
+      content: (planFindings ? `NBCS lookup results:\n${planFindings}\n\n` : '')
+        + 'Now output the final compliance assessment as JSON only, matching the schema.',
+    },
+  ];
+
+  // Mistral doesn't get strict json_schema mode here (only json_object was
+  // confirmed against Mistral's docs this session) — PLAN_REASON_SYSTEM
+  // already restates the exact JSON shape in prose (same technique
+  // groqReason's FINAL_INSTRUCTION uses), so json_object mode is enough to
+  // get a matching shape without gambling on an unconfirmed strict-schema
+  // field layout. Groq fallback keeps the strict schema it's confirmed to
+  // support.
+  let finalData = null;
+  if (mistralKey) {
+    finalData = await callMistral(mistralKey, {
+      model: 'mistral-medium-latest',
+      messages: fitMessagesToTokenBudget(rawFinalMessages, MISTRAL_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS),
+      tool_choice: 'none',
+      temperature: 0.2,
+      max_completion_tokens: PLAN_FINAL_MAX_TOKENS,
+      include_reasoning: false,
+      response_format: { type: 'json_object' },
     });
+    if (finalData.error) {
+      finalData = await callMistral(mistralKey, {
+        model: 'mistral-medium-latest',
+        messages: fitMessagesToTokenBudget(
+          [...rawFinalMessages, {
+            role: 'user',
+            content: 'Your previous reply failed JSON validation, most likely because it was cut '
+              + 'off. Return exactly one COMPLETE, valid JSON object with every required field '
+              + 'present. Keep it compact: at most six findings and short rationales.',
+          }],
+          MISTRAL_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS - 400,
+        ),
+        tool_choice: 'none',
+        temperature: 0.2,
+        max_completion_tokens: PLAN_FINAL_MAX_TOKENS + 400,
+        include_reasoning: false,
+        response_format: { type: 'json_object' },
+      });
+    }
+  }
+
+  if (!finalData || finalData.error) {
+    const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, PLAN_FINAL_MAX_TOKENS);
+    const finalMessages = fitMessagesToTokenBudget(rawFinalMessages, GROQ_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS);
+    const finalPayload = {
+      model: finalModel,
+      messages: finalMessages,
+      tool_choice: 'none',
+      temperature: 0.2,
+      max_completion_tokens: PLAN_FINAL_MAX_TOKENS,
+      reasoning_effort: 'low',
+      include_reasoning: false,
+      response_format: PLAN_RESPONSE_FORMAT,
+    };
+    finalData = await callGroq(apiKey, finalPayload);
+    // One reinforced retry on a schema-validation miss, mirroring the vision
+    // path. Without this a single malformed generation discarded an otherwise
+    // complete assessment and surfaced as "provider did not return an assessment".
+    if (finalData.error && finalData.code === 'json_validate_failed') {
+      // The usual cause is the generation being cut off mid-object, so the retry
+      // both asks for a compact answer and raises the completion room rather than
+      // repeating the same budget that truncated.
+      finalData = await callGroq(apiKey, {
+        ...finalPayload,
+        max_completion_tokens: PLAN_FINAL_MAX_TOKENS + 400,
+        messages: [...finalMessages, {
+          role: 'user',
+          content: 'Your previous reply failed schema validation, most likely because it was cut '
+            + 'off. Return exactly one COMPLETE JSON object with every required field present. '
+            + 'Keep it compact: at most six findings and short rationales. Use null (not a missing '
+            + 'field) for clauseId or page when a finding has no clause to cite.',
+        }],
+      });
+    }
   }
   if (finalData.error) return finalData;
   const value = safeJson(finalData.json?.choices?.[0]?.message?.content);
   if (!value || !Array.isArray(value.findings)) {
-    return { error: 'GPT-OSS returned an invalid plan assessment', status: 502, headers: {} };
+    return { error: 'The reasoning provider returned an invalid plan assessment', status: 502, headers: {} };
   }
-  // Forward gpt-oss-120b's own remaining-quota numbers so the client can pace
+  // Forward the provider's own remaining-quota numbers so the client can pace
   // its *next* Groq-dependent call instead of guessing a fixed delay.
   return { value: finalisePlanAssessment(value, plan), headers: finalData.headers };
 }
@@ -767,20 +820,39 @@ async function groqChat(request, env, cors, apiKey) {
     }));
   }
 
-  const data = await callGroq(apiKey, {
-    model: env.GROQ_REASON_MODEL,
-    messages: [
-      { role: 'system', content: CHAT_SYSTEM },
-      {
-        role: 'system',
-        content: `Relevant NBCS 2026 index results (cite page numbers when used):\n${JSON.stringify(nbcContext.results).slice(0, 8000)}`,
-      },
-      ...messages,
-    ],
-    temperature: 0.4,
-    max_completion_tokens: 1024,
-    include_reasoning: false,
-  });
+  const chatMessages = [
+    { role: 'system', content: CHAT_SYSTEM },
+    {
+      role: 'system',
+      content: `Relevant NBCS 2026 index results (cite page numbers when used):\n${JSON.stringify(nbcContext.results).slice(0, 8000)}`,
+    },
+    ...messages,
+  ];
+
+  // Mistral primary — Groq's per-model TPM/TPD pools kept locking this out
+  // (a daily cap lasts hours, not minutes, so a fallback alone wasn't enough
+  // for the primary spot). Groq stays as the fallback for when Mistral
+  // itself is briefly down.
+  const mistralKey = env.MISTRAL_API_KEY ? await readSecret(env.MISTRAL_API_KEY) : '';
+  let data = null;
+  if (mistralKey) {
+    data = await callMistral(mistralKey, {
+      model: 'mistral-medium-latest',
+      messages: chatMessages,
+      temperature: 0.4,
+      max_completion_tokens: 1024,
+      include_reasoning: false,
+    });
+  }
+  if (!data || data.error) {
+    data = await callGroq(apiKey, {
+      model: env.GROQ_REASON_MODEL,
+      messages: chatMessages,
+      temperature: 0.4,
+      max_completion_tokens: 1024,
+      include_reasoning: false,
+    });
+  }
   if (data.error) {
     return json({ error: data.error, retryAfterSeconds: data.retryAfterSeconds ?? null },
       data.status, { ...cors, ...data.headers });
@@ -960,36 +1032,32 @@ async function groqReason(request, env, cors, apiKey) {
   // Read once, shared by both the hop loop below and the final verdict call.
   const mistralKey = env.MISTRAL_API_KEY ? await readSecret(env.MISTRAL_API_KEY) : '';
 
-  // Tool-calling loop: let gpt-oss pull the exact clauses it needs. Deciding
-  // *which* clause to look up is a light task — prefer gpt-oss-20b (a separate
-  // TPM pool) and reserve gpt-oss-120b for the final synthesis below.
-  // Re-picked every hop (not fixed once) so if 20b's own pool is the one
-  // currently tight — e.g. a concurrent floor-plan compliance hop just used
-  // it — this automatically falls through to whichever model actually has
-  // headroom right now, rather than blindly retrying the one that's tight.
+  // Tool-calling loop: let the model pull the exact clauses it needs. Mistral
+  // primary (25,000 TPM, function-calling confirmed compatible with Groq's
+  // tools/tool_choice/tool_calls shape) — Groq's per-model TPM/TPD pools kept
+  // being the one that was tight or locked out (a daily cap lasts hours, so a
+  // fallback-only role for Groq here previously still meant grounding
+  // silently dropped whenever Groq happened to be primary and unavailable).
+  // Groq stays as the fallback for when Mistral itself is briefly down.
   for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
-    const hopModel = pickAvailableModel(
-      env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, REASON_HOP_MAX_TOKENS);
-    let data = await callGroq(apiKey, {
-      model: hopModel,
-      messages: fitMessagesToTokenBudget(messages, GROQ_TPM_BUDGET - REASON_HOP_MAX_TOKENS),
-      tools: [NBC_QUERY_TOOL],
-      tool_choice: 'auto',
-      temperature: 0.3,
-      max_completion_tokens: REASON_HOP_MAX_TOKENS,
-      include_reasoning: false,
-    });
-    if (data.error && mistralKey) {
-      // Groq's TPM pool being tight must not silently drop NBC grounding for
-      // this hop — that was the actual cause of the SAME image scoring wildly
-      // differently run to run: whether Groq happened to have headroom decided
-      // whether the final verdict was written with real clause context or
-      // none at all. Mistral supports the same tools/tool_choice/tool_calls
-      // shape (confirmed against Mistral's function-calling docs), so retry
-      // this hop there before giving up on tool calling entirely.
+    let data = null;
+    if (mistralKey) {
       data = await callMistral(mistralKey, {
         model: 'mistral-medium-latest',
         messages: fitMessagesToTokenBudget(messages, MISTRAL_TPM_BUDGET - REASON_HOP_MAX_TOKENS),
+        tools: [NBC_QUERY_TOOL],
+        tool_choice: 'auto',
+        temperature: 0.3,
+        max_completion_tokens: REASON_HOP_MAX_TOKENS,
+        include_reasoning: false,
+      });
+    }
+    if (!data || data.error) {
+      const hopModel = pickAvailableModel(
+        env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, REASON_HOP_MAX_TOKENS);
+      data = await callGroq(apiKey, {
+        model: hopModel,
+        messages: fitMessagesToTokenBudget(messages, GROQ_TPM_BUDGET - REASON_HOP_MAX_TOKENS),
         tools: [NBC_QUERY_TOOL],
         tool_choice: 'auto',
         temperature: 0.3,

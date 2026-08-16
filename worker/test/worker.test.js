@@ -321,6 +321,54 @@ test('floorplan conversion calls protected Qwen service then GPT-OSS NBCS assess
   assert.equal(groqPayload.reasoning_effort, 'low');
 });
 
+test('plan compliance uses Mistral as primary for both the hop loop and final verdict, never touching Groq', async (t) => {
+  let mistralFinalPayload = null;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url) === 'https://floorplan.test/convert') {
+      return Response.json({
+        buildingProfile: { occupancy: 'Business' },
+        topology: {
+          units: 'mm', mm_per_px: 10,
+          walls: [{ id: 'w0', start: [0, 0], end: [500, 0], wall_type: 'external', thickness_mm: 200 }],
+          rooms: [{ id: 'office', type: 'OFFICE', boundary: [[0, 0], [50, 0], [50, 50], [0, 50]] }],
+          room_graph: { nodes: [], edges: [] },
+        },
+        metrics: { walls: 1, rooms: 1 }, artifacts: {},
+      });
+    }
+    if (String(url).includes('api.groq.com')) {
+      throw new Error('Groq must not be called when Mistral succeeds throughout');
+    }
+    const payload = JSON.parse(options.body);
+    if (payload.tool_choice === 'none') {
+      mistralFinalPayload = payload;
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        planSummary: 'Assessed via Mistral.', score: 80,
+        findings: [{
+          check: 'Corridor width', status: 'compliant', severity: 'minor',
+          observed: '900mm', required: 'Per queried clause', measurementEvidence: '900mm',
+          clauseId: '', page: null, rationale: 'Meets minimum.',
+        }],
+        citedClauses: [], limitations: [],
+      }) } }] });
+    }
+    // Hop call — no tool calls needed for this scenario.
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+  });
+
+  const form = new FormData();
+  form.append('file', new Blob(['plan'], { type: 'image/png' }), 'plan.png');
+  const response = await worker.fetch(new Request('https://worker.test/plan/convert', {
+    method: 'POST', headers: { Origin: origin }, body: form,
+  }), env({ MISTRAL_API_KEY: 'test-mistral-key' }));
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.compliance.planSummary, 'Assessed via Mistral.');
+  assert.equal(mistralFinalPayload.model, 'mistral-medium-latest');
+  assert.deepEqual(mistralFinalPayload.response_format, { type: 'json_object' });
+});
+
 test('plan compliance can query_nbc for a specific measured condition before concluding', async (t) => {
   const groqCalls = [];
   t.mock.method(globalThis, 'fetch', async (url, options) => {
@@ -467,6 +515,22 @@ test('chat fails closed when the reasoning limiter is missing', async () => {
   assert.equal((await response.json()).error, 'rate limiter is not configured');
 });
 
+test('chat uses Mistral as primary and never calls Groq when Mistral succeeds', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    if (String(url).includes('api.groq.com')) throw new Error('Groq must not be called');
+    if (String(url).includes('api.mistral.ai')) {
+      return Response.json({ choices: [{ message: { content: 'Mistral chat reply' } }] });
+    }
+    return Response.json({ results: [] });
+  });
+  const response = await worker.fetch(
+    post('/groq/chat', { messages: [{ role: 'user', content: 'hello' }] }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).content, 'Mistral chat reply');
+});
+
 test('reasoning reserves five model-call units and returns 429 before Groq', async () => {
   let calls = 0;
   const limiter = { limit: async () => ({ success: ++calls < 4 }) };
@@ -582,8 +646,10 @@ test('groqReason uses Mistral as primary when MISTRAL_API_KEY is configured and 
   // the same findings always produce the same score regardless of provider.
   assert.equal(body.score, 100);
 
-  const mistralIndex = seenUrls.findIndex(u => u.includes('api.mistral.ai'));
-  assert.ok(mistralIndex >= 0, 'Mistral should be called');
+  // The hop loop now also tries Mistral first, so there can be more than one
+  // Mistral call — find the FINAL verdict one specifically (tool_choice: 'none').
+  const mistralIndex = seenUrls.findIndex((u, i) => u.includes('api.mistral.ai') && seenPayloads[i].tool_choice === 'none');
+  assert.ok(mistralIndex >= 0, 'Mistral should be called for the final verdict');
   const mistralPayload = seenPayloads[mistralIndex];
   assert.equal(mistralPayload.model, 'mistral-medium-latest');
   assert.deepEqual(mistralPayload.response_format, { type: 'json_object' });
@@ -597,7 +663,9 @@ test('groqReason uses Mistral as primary when MISTRAL_API_KEY is configured and 
 test('groqReason returns an explicit error when Mistral fails outright — no Groq fallback for the final verdict', async (t) => {
   // Per explicit instruction: the final verdict call is Mistral-only now.
   // A genuine outage (500, not a generation-validation failure) is not
-  // retried and must not silently fall through to Groq.
+  // retried and must not silently fall through to Groq. (The hop loop is a
+  // separate concern — it DOES fall back to Groq, so it still succeeds here;
+  // it's specifically the final verdict that has no Groq fallback.)
   const seenUrls = [];
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     seenUrls.push(String(url));
@@ -618,8 +686,10 @@ test('groqReason returns an explicit error when Mistral fails outright — no Gr
   assert.equal(response.status, 500);
   const body = await response.json();
   assert.ok(body.error.includes('Mistral call failed'));
+  // One 500 for the hop (falls back to Groq, no retry on Mistral there) and
+  // one 500 for the final verdict (also not retried — a genuine outage).
   const mistralCalls = seenUrls.filter((u) => u.includes('api.mistral.ai'));
-  assert.equal(mistralCalls.length, 1, 'a genuine 500 is not retried');
+  assert.equal(mistralCalls.length, 2, 'a genuine 500 is not retried on either call');
 });
 
 test('groqReason returns an explicit error when MISTRAL_API_KEY is not configured, without ever calling Groq for the verdict', async (t) => {
@@ -815,12 +885,20 @@ test('a verdict covering fewer findings than detected equipment types is retried
   // covered 2 of them — silently dropping equipment the previous phase
   // actually found. The audit must not move forward on that; it gets one
   // corrective retry naming the exact gap before either recovering or failing.
-  let mistralCalls = 0;
+  // The hop loop now also calls Mistral first, so identify calls by
+  // tool_choice (the final verdict always sends tool_choice:'none') rather
+  // than by raw call order/count.
+  let finalCalls = 0;
   let secondCallContent = '';
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     if (String(url).includes('api.mistral.ai')) {
-      mistralCalls++;
-      if (mistralCalls === 1) {
+      const payload = JSON.parse(options.body);
+      if (payload.tool_choice !== 'none') {
+        // Hop call — no tools needed for this scenario, exit immediately.
+        return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+      }
+      finalCalls++;
+      if (finalCalls === 1) {
         return Response.json({ choices: [{ message: { content: JSON.stringify({
           occupancySummary: 'Partial audit', score: 50,
           findings: [{
@@ -831,7 +909,7 @@ test('a verdict covering fewer findings than detected equipment types is retried
           citedClauses: [],
         }) } }] });
       }
-      const userMsgs = JSON.parse(options.body).messages.filter((m) => m.role === 'user');
+      const userMsgs = payload.messages.filter((m) => m.role === 'user');
       secondCallContent = String(userMsgs[userMsgs.length - 1]?.content || '');
       return Response.json({ choices: [{ message: { content: JSON.stringify({
         occupancySummary: 'Complete audit', score: 50,
@@ -860,7 +938,7 @@ test('a verdict covering fewer findings than detected equipment types is retried
   );
 
   assert.equal(response.status, 200);
-  assert.equal(mistralCalls, 2, 'a short verdict triggers exactly one corrective retry');
+  assert.equal(finalCalls, 2, 'a short verdict triggers exactly one corrective retry');
   assert.ok(secondCallContent.includes('only covered 1 of the 3'), 'the retry names the exact coverage gap');
   const body = await response.json();
   assert.equal(body.findings.length, 3);
