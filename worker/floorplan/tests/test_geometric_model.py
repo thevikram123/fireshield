@@ -133,3 +133,30 @@ def test_attach_openings_confirms_a_match_and_flags_a_geometry_miss():
     assert by_kind["door"]["confirmedByGeometry"] is True
     assert by_kind["window"]["confirmedByGeometry"] is False
     assert by_kind["door"]["nearestWallId"] == "wall_0"
+
+
+def test_attach_openings_undoes_apply_scale_before_comparing():
+    """`deterministic_doors`/`deterministic_windows` are read off
+    `result.model` AFTER pipeline.convert() has already run apply_scale() —
+    which converts every coordinate to mm and flips Y for CAD export (see
+    reconstruct.apply_scale). Mistral's positionFraction is still raw pixel
+    space. Live-confirmed regression: without undoing that transform here,
+    EVERY comparison came out "far" (comparing mm distances against a
+    pixel-space match radius), so a real, correctly-traced door a few px
+    from a vision hit was reported as missed. mm_per_px=10, image 200x100px
+    -> a door genuinely at pixel (50, 2) is stored post-scale as
+    ((50*10), (100-2)*10) = (500.0, 980.0)."""
+    model = {
+        "walls": [{"id": "wall_0", "start": {"px": [0.0, 0.0]}, "end": {"px": [200.0, 0.0]}, "thicknessMm": 8.0}],
+    }
+    deterministic_doors = [{"center": [500.0, 980.0]}]  # (50, 2)px scaled to mm and Y-flipped
+    mistral_openings = [
+        {"kind": "door", "positionFraction": [0.25, 0.01], "confidence": 0.9},  # same real spot, in px fraction
+    ]
+
+    attach_openings(
+        model, mistral_openings, image_size_px=(200, 100), mm_per_px=10.0,
+        deterministic_doors=deterministic_doors, deterministic_windows=[],
+    )
+
+    assert model["openings"][0]["confirmedByGeometry"] is True

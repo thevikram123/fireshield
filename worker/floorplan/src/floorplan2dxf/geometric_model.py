@@ -128,6 +128,20 @@ def attach_openings(
     The compliance reasoning step is instructed to treat those as evidence
     of at least one more opening than the traced count, not to invent a
     width for it (see PLAN_REASON_SYSTEM in worker.js).
+
+    `deterministic_doors`/`deterministic_windows` are `Door.to_dict()`/
+    `Window.to_dict()` from `result.model` AFTER `pipeline.convert()` has
+    already run `apply_scale()` — which converts every coordinate to mm AND
+    flips Y for CAD/DXF export (image Y-down -> CAD Y-up). Vision positions
+    here are still raw pixel space (image Y-down), the same convention
+    `build_geometric_model()` itself requires running BEFORE apply_scale for
+    (see that module's docstring) — mixing the two silently makes every
+    distance wrong, live-confirmed here: with centers left in mm, EVERY
+    comparison came out "far" regardless of drawing, since px and mm are
+    different units entirely. Undoing apply_scale's transform (only when
+    mm_per_px was actually applied — `model.units == "px"` otherwise, a
+    no-op) restores a fair comparison without touching the real, exported
+    geometry.
     """
     from .grid import dist_point_to_segment, grid_spec_for_image
     import math
@@ -136,15 +150,22 @@ def attach_openings(
     grid_spec = grid_spec_for_image((img_h, img_w), mm_per_px=mm_per_px)
     walls = model.get("walls", [])
     match_px = max(img_w, img_h) * 0.04
+
+    def undo_scale(center: list) -> tuple[float, float]:
+        x, y = float(center[0]), float(center[1])
+        if not mm_per_px:
+            return x, y
+        return x / mm_per_px, img_h - y / mm_per_px
+
     det_centers: dict[str, list[tuple[float, float]]] = {"door": [], "window": []}
     for door in deterministic_doors:
         center = door.get("center")
         if center:
-            det_centers["door"].append((float(center[0]), float(center[1])))
+            det_centers["door"].append(undo_scale(center))
     for window in deterministic_windows:
         center = window.get("center")
         if center:
-            det_centers["window"].append((float(center[0]), float(center[1])))
+            det_centers["window"].append(undo_scale(center))
 
     resolved = []
     for item in mistral_openings:
