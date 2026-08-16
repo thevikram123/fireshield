@@ -495,7 +495,11 @@ test('groqReason uses Mistral as primary when MISTRAL_API_KEY is configured and 
             content: JSON.stringify({
               occupancySummary: 'Business occupancy (Mistral)',
               score: 95,
-              findings: [],
+              findings: [{
+                system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
+                observed: '2 extinguishers observed', required: 'per clause', clauseId: '', page: null,
+                rationale: 'meets requirement',
+              }],
               citedClauses: []
             })
           }
@@ -519,7 +523,10 @@ test('groqReason uses Mistral as primary when MISTRAL_API_KEY is configured and 
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.occupancySummary, 'Business occupancy (Mistral)');
-  assert.equal(body.score, 95);
+  // The model's own "95" is discarded — score is always recomputed
+  // deterministically from findings (one compliant/minor finding -> 100), so
+  // the same findings always produce the same score regardless of provider.
+  assert.equal(body.score, 100);
 
   const mistralIndex = seenUrls.findIndex(u => u.includes('api.mistral.ai'));
   assert.ok(mistralIndex >= 0, 'Mistral should be called');
@@ -554,7 +561,11 @@ test('groqReason falls back to Groq when MISTRAL_API_KEY is configured but Mistr
               content: JSON.stringify({
                 occupancySummary: 'Business occupancy (Groq fallback)',
                 score: 85,
-                findings: [],
+                findings: [{
+                  system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
+                  observed: '2 extinguishers observed', required: 'per clause', clauseId: '', page: null,
+                  rationale: 'meets requirement',
+                }],
                 citedClauses: []
               })
             }
@@ -576,7 +587,7 @@ test('groqReason falls back to Groq when MISTRAL_API_KEY is configured but Mistr
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.occupancySummary, 'Business occupancy (Groq fallback)');
-  assert.equal(body.score, 85);
+  assert.equal(body.score, 100);
 
   assert.ok(seenUrls.includes('https://api.mistral.ai/v1/chat/completions'), 'Mistral should have been tried');
   const groqCalls = seenUrls.filter(u => u.includes('api.groq.com'));
@@ -597,7 +608,11 @@ test('groqReason goes straight to Groq when MISTRAL_API_KEY is not configured', 
               content: JSON.stringify({
                 occupancySummary: 'Business occupancy (Groq straight)',
                 score: 80,
-                findings: [],
+                findings: [{
+                  system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
+                  observed: '2 extinguishers observed', required: 'per clause', clauseId: '', page: null,
+                  rationale: 'meets requirement',
+                }],
                 citedClauses: []
               })
             }
@@ -617,7 +632,7 @@ test('groqReason goes straight to Groq when MISTRAL_API_KEY is not configured', 
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.occupancySummary, 'Business occupancy (Groq straight)');
-  assert.equal(body.score, 80);
+  assert.equal(body.score, 100);
 
   assert.ok(!seenUrls.includes('https://api.mistral.ai/v1/chat/completions'), 'Mistral should not be called');
   const groqCalls = seenUrls.filter(u => u.includes('api.groq.com'));
@@ -631,16 +646,32 @@ test('a 429 on the tool-selection hop degrades to the final verdict instead of f
   // call, the one that's actually resilient now, ever got a chance to run.
   // A tight hop must degrade (proceed with whatever tool results already
   // exist, possibly none) rather than fail the whole audit outright.
-  let mistralCalled = false;
+  // Groq 429s on every hop attempt (including the hop's own Mistral fallback
+  // being tried and failing, per the tool-calling grounding fix) and must
+  // still degrade to a working final verdict rather than surface the hop's
+  // 429 to the client.
+  let mistralCalls = 0;
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     if (String(url).includes('api.mistral.ai')) {
-      mistralCalled = true;
-      return Response.json({ choices: [{ message: { content: JSON.stringify({
-        occupancySummary: 'Answered despite the hop failing', score: 60,
-        findings: [], citedClauses: [],
-      }) } }] });
+      mistralCalls++;
+      const payload = JSON.parse(options.body);
+      if (payload.tool_choice === 'none') {
+        return Response.json({ choices: [{ message: { content: JSON.stringify({
+          occupancySummary: 'Answered despite the hop failing', score: 60,
+          findings: [{
+            system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
+            observed: '2 extinguishers observed', required: 'per clause', clauseId: '', page: null,
+            rationale: 'meets requirement',
+          }],
+          citedClauses: [],
+        }) } }] });
+      }
+      // The hop's own Mistral fallback also fails here, forcing the degrade path.
+      return new Response(JSON.stringify({
+        error: { code: 'rate_limit_exceeded', message: 'Rate limit reached' },
+      }), { status: 429, headers: {} });
     }
-    // The hop call itself 429s — no Retry-After, so callGroq's own retry
+    // The Groq hop call itself 429s — no Retry-After, so callGroq's own retry
     // doesn't apply either; this must still not reach the client as an error.
     return new Response(JSON.stringify({
       error: { code: 'rate_limit_exceeded', message: 'Rate limit reached for openai/gpt-oss-20b' },
@@ -653,7 +684,96 @@ test('a 429 on the tool-selection hop degrades to the final verdict instead of f
   );
 
   assert.equal(response.status, 200);
-  assert.ok(mistralCalled, 'the final verdict call must still run after the hop degrades');
+  assert.ok(mistralCalls >= 2, 'the final verdict call must still run after the hop degrades');
   const body = await response.json();
   assert.equal(body.occupancySummary, 'Answered despite the hop failing');
+});
+
+test('an empty-findings ("incompatible json") final reply is retried once, then falls back to Groq', async (t) => {
+  // Live-observed: a provider answered HTTP 200 with a shape that didn't
+  // match what the client needs (empty/malformed findings) and that garbage
+  // was returned to the client as a 200. Mistral now gets one corrective
+  // retry, and if it still comes back broken, Groq is tried as a fresh
+  // attempt (not just left to inherit Mistral's failure).
+  let mistralFinalCalls = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url).includes('api.mistral.ai')) {
+      mistralFinalCalls++;
+      // Every Mistral attempt (including the corrective retry) comes back
+      // with an empty findings array — permanently malformed for this provider.
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Broken Mistral reply', score: 40, findings: [], citedClauses: [],
+      }) } }] });
+    }
+    const payload = JSON.parse(options.body);
+    if (payload.tool_choice === 'none') {
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Groq recovered the audit', score: 20,
+        findings: [{
+          system: 'Sprinkler System', status: 'critical_gap', severity: 'critical',
+          observed: 'No sprinkler heads detected', required: 'mandatory coverage', clauseId: '', page: null,
+          rationale: 'no detections',
+        }],
+        citedClauses: [],
+      }) } }] });
+    }
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(mistralFinalCalls, 2, 'Mistral gets exactly one corrective retry before giving up');
+  const body = await response.json();
+  assert.equal(body.occupancySummary, 'Groq recovered the audit');
+  assert.equal(body.score, 0);
+});
+
+test('a final reply that stays malformed on every provider returns an explicit error, never fabricated 200 content', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url).includes('api.mistral.ai')) {
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Broken everywhere', score: 40, findings: [], citedClauses: [],
+      }) } }] });
+    }
+    const payload = JSON.parse(options.body);
+    if (payload.tool_choice === 'none') {
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Also broken', score: 40, findings: [], citedClauses: [],
+      }) } }] });
+    }
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 502);
+  const body = await response.json();
+  assert.ok(body.error, 'must surface an explicit error, not a 200 with an empty/broken verdict');
+});
+
+test('computeComplianceScore is deterministic for identical findings regardless of caller', async () => {
+  const findings = [
+    { system: 'A', status: 'compliant', severity: 'minor' },
+    { system: 'B', status: 'critical_gap', severity: 'critical' },
+    { system: 'C', status: 'gap', severity: 'major' },
+  ];
+  const first = __testing__.computeComplianceScore(findings);
+  const second = __testing__.computeComplianceScore(JSON.parse(JSON.stringify(findings)));
+  assert.equal(first.score, second.score);
+  // weightedScore = 100*1 + 0*3 + 35*2 = 170, totalWeight = 1+3+2 = 6 -> 28.33
+  assert.ok(Math.abs(first.score - 28.33) < 0.01);
+});
+
+test('isValidVerdict rejects empty findings and unknown status/severity enums', () => {
+  assert.equal(__testing__.isValidVerdict({ findings: [] }), false);
+  assert.equal(__testing__.isValidVerdict({ findings: [{ status: 'compliant', severity: 'minor' }] }), true);
+  assert.equal(__testing__.isValidVerdict({ findings: [{ status: 'fine', severity: 'minor' }] }), false);
+  assert.equal(__testing__.isValidVerdict({ findings: [{ status: 'compliant', severity: 'huge' }] }), false);
 });

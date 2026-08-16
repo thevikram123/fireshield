@@ -418,6 +418,39 @@ async function assessFloorplan(converted, env, apiKey) {
   return { value: finalisePlanAssessment(value, plan), headers: finalData.headers };
 }
 
+// Shared by plan and site-audit scoring so "same findings -> same score" holds
+// regardless of which model or provider produced the findings. A freeform
+// LLM-supplied score is never trustworthy on its own: the same input can
+// legitimately produce a low sample-to-sample variance in *findings*, but the
+// score attached to a given set of findings must not additionally vary —
+// e.g. three "minor" findings must never compute to 0%.
+const COMPLIANCE_SEVERITY_WEIGHT = { minor: 1, major: 2, critical: 3 };
+const COMPLIANCE_STATUS_SCORE = { compliant: 100, gap: 35, critical_gap: 0, cannot_verify: 50 };
+
+function computeComplianceScore(findings) {
+  let weightedScore = 0;
+  let totalWeight = 0;
+  let verifiable = 0;
+  for (const finding of findings) {
+    const weight = COMPLIANCE_SEVERITY_WEIGHT[finding?.severity] || 1;
+    weightedScore += (COMPLIANCE_STATUS_SCORE[finding?.status] ?? 50) * weight;
+    totalWeight += weight;
+    if (finding?.status !== 'cannot_verify') verifiable++;
+  }
+  return {
+    score: totalWeight ? weightedScore / totalWeight : 50,
+    verifiable,
+    evidenceFraction: findings.length ? verifiable / findings.length : 0,
+  };
+}
+
+function isValidVerdict(v) {
+  return !!v && Array.isArray(v.findings) && v.findings.length > 0
+    && v.findings.every((f) => f
+      && typeof f.status === 'string' && f.status in COMPLIANCE_STATUS_SCORE
+      && typeof f.severity === 'string' && f.severity in COMPLIANCE_SEVERITY_WEIGHT);
+}
+
 function finalisePlanAssessment(value, plan) {
   // clauseId/page are nullable in the schema (a cannot_verify finding has no
   // clause to cite). Normalise to '' here so the app and stored history keep
@@ -436,18 +469,7 @@ function finalisePlanAssessment(value, plan) {
     }));
   }
   const findings = Array.isArray(value.findings) ? value.findings : [];
-  const severityWeight = { minor: 1, major: 2, critical: 3 };
-  const statusScore = { compliant: 100, gap: 35, critical_gap: 0, cannot_verify: 50 };
-  let weightedScore = 0;
-  let totalWeight = 0;
-  let verifiable = 0;
-  for (const finding of findings) {
-    const weight = severityWeight[finding.severity] || 1;
-    weightedScore += (statusScore[finding.status] ?? 50) * weight;
-    totalWeight += weight;
-    if (finding.status !== 'cannot_verify') verifiable++;
-  }
-  const calculated = totalWeight ? weightedScore / totalWeight : 50;
+  const { score: calculated, verifiable } = computeComplianceScore(findings);
   const supplied = typeof value.score === 'number' ? value.score : Number.NaN;
   const score = Number.isFinite(supplied) ? supplied : calculated;
   const evidenceFraction = findings.length ? verifiable / findings.length : 0;
@@ -834,9 +856,22 @@ async function groqReason(request, env, cors, apiKey) {
   const observedTypes = [...new Set(detected.map((item) => String(item?.type || '')))]
     .filter((type) => VISUAL_GUIDANCE_QUERIES[type])
     .slice(0, 8);
+  // Table 7/7C protection-level rows are occupancy+height-keyed in their own
+  // label text (e.g. "Table 7C Hospital CL-4: Height not exceeding 45 m...
+  // Spr R"). A generic per-type query like "sprinkler requirement" never
+  // matches those tokens, so the retrieval surfaced only generic definitional
+  // nodes and the model correctly (but unhelpfully) marked everything
+  // cannot_verify. Folding the building's own occupancy/height/area into the
+  // query is what actually finds the row that applies to THIS building.
+  const occupancyHint = [profile.occupancy, profile.heightM ? `${profile.heightM}m height` : '',
+    profile.floorAreaSqm ? `${profile.floorAreaSqm} sqm` : '']
+    .filter(Boolean).join(' ');
   const observedGuidance = await Promise.all(observedTypes.map(async (type) => {
     try {
-      const result = await queryNbc(env, VISUAL_GUIDANCE_QUERIES[type], { k: 3, hops: 1 });
+      const query = occupancyHint
+        ? `${occupancyHint} Table 7 protection level ${VISUAL_GUIDANCE_QUERIES[type]}`
+        : VISUAL_GUIDANCE_QUERIES[type];
+      const result = await queryNbc(env, query, { k: 4, hops: 1 });
       return { type, results: result.results };
     } catch (error) {
       return { type, error: 'NBCS guidance lookup failed' };
@@ -854,6 +889,9 @@ async function groqReason(request, env, cors, apiKey) {
     }) },
   ];
 
+  // Read once, shared by both the hop loop below and the final verdict call.
+  const mistralKey = env.MISTRAL_API_KEY ? await readSecret(env.MISTRAL_API_KEY) : '';
+
   // Tool-calling loop: let gpt-oss pull the exact clauses it needs. Deciding
   // *which* clause to look up is a light task — prefer gpt-oss-20b (a separate
   // TPM pool) and reserve gpt-oss-120b for the final synthesis below.
@@ -864,7 +902,7 @@ async function groqReason(request, env, cors, apiKey) {
   for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
     const hopModel = pickAvailableModel(
       env.GROQ_LIGHT_MODEL || env.GROQ_REASON_MODEL, env.GROQ_REASON_MODEL, REASON_HOP_MAX_TOKENS);
-    const data = await callGroq(apiKey, {
+    let data = await callGroq(apiKey, {
       model: hopModel,
       messages: fitMessagesToTokenBudget(messages, GROQ_TPM_BUDGET - REASON_HOP_MAX_TOKENS),
       tools: [NBC_QUERY_TOOL],
@@ -873,15 +911,29 @@ async function groqReason(request, env, cors, apiKey) {
       max_completion_tokens: REASON_HOP_MAX_TOKENS,
       include_reasoning: false,
     });
+    if (data.error && mistralKey) {
+      // Groq's TPM pool being tight must not silently drop NBC grounding for
+      // this hop — that was the actual cause of the SAME image scoring wildly
+      // differently run to run: whether Groq happened to have headroom decided
+      // whether the final verdict was written with real clause context or
+      // none at all. Mistral supports the same tools/tool_choice/tool_calls
+      // shape (confirmed against Mistral's function-calling docs), so retry
+      // this hop there before giving up on tool calling entirely.
+      data = await callMistral(mistralKey, {
+        model: 'mistral-medium-latest',
+        messages: fitMessagesToTokenBudget(messages, MISTRAL_TPM_BUDGET - REASON_HOP_MAX_TOKENS),
+        tools: [NBC_QUERY_TOOL],
+        tool_choice: 'auto',
+        temperature: 0.3,
+        max_completion_tokens: REASON_HOP_MAX_TOKENS,
+        include_reasoning: false,
+      });
+    }
     if (data.error) {
-      // This hop only decides which NBC clause to look up next — Groq being
-      // tight here must not fail the whole audit (that's exactly what was
-      // still happening live even after the final call gained a Mistral
-      // fallback: this hop returned early on its own 429, before the final
-      // call — the one actually resilient now — ever ran). Degrade instead:
-      // stop gathering further tool results and proceed to the final verdict
-      // with whatever was found so far (possibly nothing), same as when the
-      // model simply returns no more tool_calls.
+      // Both providers are tight/unavailable for this hop — degrade instead
+      // of failing the whole audit: stop gathering further tool results and
+      // proceed to the final verdict with whatever was found so far (possibly
+      // nothing), same as when the model simply returns no more tool_calls.
       break;
     }
 
@@ -922,40 +974,75 @@ async function groqReason(request, env, cors, apiKey) {
       content: (reasonFindings ? `NBCS lookup results:\n${reasonFindings}\n\n` : '') + FINAL_INSTRUCTION,
     },
   ];
+  const shapeRetryMessages = (msgs) => [...msgs, {
+    role: 'user',
+    content: 'Your previous reply did not match the required JSON shape (missing/empty '
+      + '"findings", or a finding missing a valid "status" or "severity" enum value). Return '
+      + 'the SAME assessment again, corrected to match the shape exactly.',
+  }];
 
-  const mistralKey = env.MISTRAL_API_KEY ? await readSecret(env.MISTRAL_API_KEY) : '';
-  let finalData = null;
-  if (mistralKey) {
-    finalData = await callMistral(mistralKey, {
+  async function callMistralFinal(msgs) {
+    if (!mistralKey) return null;
+    return callMistral(mistralKey, {
       model: 'mistral-medium-latest',
-      messages: fitMessagesToTokenBudget(rawFinalMessages, MISTRAL_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
+      messages: fitMessagesToTokenBudget(msgs, MISTRAL_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
       tool_choice: 'none',
       temperature: 0.2,
       max_completion_tokens: REASON_FINAL_MAX_TOKENS,
       include_reasoning: false,
       response_format: { type: 'json_object' },
     });
+  }
+  async function callGroqFinal(msgs) {
+    const finalModel = pickAvailableModel(
+      env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, REASON_FINAL_MAX_TOKENS);
+    return callGroq(apiKey, {
+      model: finalModel,
+      messages: fitMessagesToTokenBudget(msgs, GROQ_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
+      tool_choice: 'none',
+      temperature: 0.2,
+      max_completion_tokens: REASON_FINAL_MAX_TOKENS,
+      include_reasoning: false,
+      response_format: { type: 'json_object' },
+    });
+  }
+  // Try one provider, and if it answers but with a malformed/incompatible
+  // shape, give it exactly one corrective retry before giving up on it — this
+  // is what was missing: a provider returning HTTP 200 with a broken shape
+  // was previously returned to the client as-is (the "incompatible json"
+  // symptom), instead of being caught and retried or handed to the fallback.
+  async function attempt(callFn, msgs) {
+    let data = await callFn(msgs);
+    if (!data || data.error) return { data, verdict: null };
+    let verdict = safeJson(data.json?.choices?.[0]?.message?.content);
+    if (isValidVerdict(verdict)) return { data, verdict };
+    data = await callFn(shapeRetryMessages(msgs));
+    if (!data || data.error) return { data, verdict: null };
+    verdict = safeJson(data.json?.choices?.[0]?.message?.content);
+    return { data, verdict: isValidVerdict(verdict) ? verdict : null };
+  }
+
+  let { data: finalData, verdict } = await attempt(callMistralFinal, rawFinalMessages);
+  if (!verdict) {
+    ({ data: finalData, verdict } = await attempt(callGroqFinal, rawFinalMessages));
   }
 
   if (!finalData || finalData.error) {
-    const finalModel = pickAvailableModel(
-      env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, REASON_FINAL_MAX_TOKENS);
-    finalData = await callGroq(apiKey, {
-      model: finalModel,
-      messages: fitMessagesToTokenBudget(rawFinalMessages, GROQ_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
-      tool_choice: 'none',
-      temperature: 0.2,
-      max_completion_tokens: REASON_FINAL_MAX_TOKENS,
-      include_reasoning: false,
-      response_format: { type: 'json_object' },
-    });
+    return json({ error: finalData?.error || 'reasoning call failed', retryAfterSeconds: finalData?.retryAfterSeconds ?? null },
+      finalData?.status || 502, { ...cors, ...(finalData?.headers || {}) });
+  }
+  if (!verdict) {
+    return json({ error: 'compliance verdict returned an invalid shape after retry' }, 502,
+      { ...cors, ...finalData.headers });
   }
 
-  if (finalData.error) {
-    return json({ error: finalData.error, retryAfterSeconds: finalData.retryAfterSeconds ?? null },
-      finalData.status, { ...cors, ...finalData.headers });
-  }
-  const verdict = safeJson(finalData.json?.choices?.[0]?.message?.content) || {};
+  // Score must not be a freeform model guess — that's what let the SAME image
+  // score wildly differently across runs/providers even with similar
+  // findings. Compute it deterministically from the findings actually
+  // returned (which FINAL_INSTRUCTION now grounds in the detected[] equipment
+  // from the previous phase), so identical findings always yield the same
+  // score regardless of which provider or run produced them.
+  verdict.score = Math.round(computeComplianceScore(verdict.findings).score);
   return json(verdict, 200, { ...cors, ...finalData.headers });
 }
 
@@ -1180,7 +1267,12 @@ const REASON_SYSTEM =
   + 'coverage of the relevant floor/area. CLIPSeg supplies object-location evidence only; '
   + 'Qwen condition notes may be used as observations but not as measurements or certificates. '
   + 'For every observed equipment class, query the applicable inspection/placement guidance. '
-  + 'Cite the clause id and page from '
+  + 'Table 7/7C-style protection-level tables are occupancy- and height-specific '
+  + '(e.g. "Table 7C Hospital CL-4: Height not exceeding 45 m... Spr R") — always include the '
+  + 'building\'s occupancy classification and height/area in your query_nbc question '
+  + '(e.g. "Table 7 sprinkler requirement for Group C Hospital, height 22m, 4500 sqm"), not just '
+  + 'the system name, or you will only find generic definitions instead of the row that applies '
+  + 'to this building. Cite the clause id and page from '
   + 'the tool results. Call query_nbc once per system before concluding.';
 
 const FINAL_INSTRUCTION =
@@ -1202,7 +1294,13 @@ const FINAL_INSTRUCTION =
   + '"severity": "minor"|"major"|"critical", "observed": string, "required": string, '
   + '"clauseId": string, "page": number, "rationale": string}], '
   + '"citedClauses": [{"id": string, "title": string, "page": number}]}. '
-  + 'Base every finding only on the query_nbc tool results already gathered.';
+  + 'Base every finding only on the query_nbc tool results already gathered. '
+  + 'Every finding must be traceable to either (a) a specific item in the detectedEquipment '
+  + 'list already provided in this conversation, evaluated against its queried requirement, or '
+  + '(b) a mandatory system for this occupancy/height/area with zero matching detections, marked '
+  + 'critical_gap. Do not invent findings for systems that are neither detected nor mandatory. '
+  + 'The "score" field you output is informational only and will be recalculated '
+  + 'server-side from your findings — it does not need to be precise, but findings/status/severity must be.';
 
 const PLAN_REASON_SYSTEM =
   'You are FireShield AI assessing a building plan against NBCS 2026 Part F (India). '
@@ -1408,4 +1506,5 @@ function json(value, status, headers = {}) {
 // unrelated tests in the same process).
 export const __testing__ = {
   pickAvailableModel, groqQuota, fitMessagesToTokenBudget, estimateTokens, summariseToolLoop, callMistral,
+  computeComplianceScore, isValidVerdict,
 };
