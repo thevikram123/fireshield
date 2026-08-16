@@ -9,6 +9,7 @@ from .calibrate import calibrate_auto, calibrate_from_span, calibrate_from_wall_
 from .commercial_model import build_commercial_model
 from .correction import constrain_geometry_to_spec
 from .export_dxf import write_dxf
+from .geometric_model import build_geometric_model
 from .geometry import extract_geometry
 from .ingest import load_raster
 from .ocr import run_ocr
@@ -30,6 +31,7 @@ class ConvertResult:
     mm_per_px: Optional[float]
     warnings: list[str]
     commercial_model: dict
+    geometric_model: dict = None  # walls/intersections/dimensions/text labels — see geometric_model.py
 
 
 def convert(
@@ -203,6 +205,15 @@ def convert(
         )
         write_overlay(prep.display_rgb, plan, overlay_path)
 
+    # Wall IDs + intersection graph + OCR-dimension-to-wall resolution + text
+    # labels — an explicit, LLM-ready geometric model (see geometric_model.py
+    # for the full history/design notes). MUST run before apply_scale() below:
+    # that function converts to mm AND flips the Y axis for DXF/CAD export,
+    # which would silently corrupt every distance calculation here if mixed
+    # with the raw-pixel wall/OCR coordinates this model is built from.
+    # Purely deterministic (no vision call) — safe to always compute.
+    geometric_model = build_geometric_model(cv_geom, texts, plan.image_size, scale)
+
     plan = apply_scale(plan, scale)
     dxf_path = write_dxf(plan, out_path)
 
@@ -234,4 +245,5 @@ def convert(
         mm_per_px=scale,
         warnings=warnings,
         commercial_model=commercial_model,
+        geometric_model=geometric_model,
     )

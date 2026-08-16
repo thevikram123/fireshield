@@ -19,9 +19,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
+from .geometric_model import attach_subcomponents
 from .guidance import (
     QwenTopologyGuide,
     dimension_read_prompt,
+    identify_subcomponents_via_mistral,
     read_dimensions_via_mistral,
     specify_via_mistral,
 )
@@ -114,10 +116,27 @@ async def convert_plan(
             )
             json_path = result.json_path
             overlay_path = result.overlay_path
+            geometric_model = result.geometric_model or {}
+            # Subcomponent identification (furniture/fixtures/staircase) is a
+            # separate advisory vision call, same reasoning as the Qwen/
+            # Mistral space-and-opening advisory above: it must never gate or
+            # replace the deterministic geometry, only add to it. Given OCR
+            # label hints from the geometric model already built above (per
+            # user direction: "taking hint from OCR labels too"), and
+            # resolved to the nearest wall(s) afterward.
+            if geometric_model:
+                subcomponents = _subcomponent_advisory(
+                    source, page, geometric_model.get("textLabels", []),
+                )
+                attach_subcomponents(
+                    geometric_model, subcomponents,
+                    image_size_px=result.model.image_size, mm_per_px=result.mm_per_px,
+                )
             return {
                 "buildingProfile": profile,
                 "topology": result.model.to_dict(),
                 "commercialModel": result.commercial_model,
+                "geometricModel": geometric_model,
                 "warnings": result.warnings,
                 "visionAdvisory": vision_advisory,
                 "artifacts": {
@@ -182,6 +201,25 @@ def _cached_qwen_advisory(
         while len(_ADVISORY_CACHE) > _ADVISORY_CACHE_MAX:
             _ADVISORY_CACHE.popitem(last=False)
     return advisory
+
+
+def _subcomponent_advisory(source: Path, page: int, text_labels: list[dict]) -> list[dict]:
+    """Mistral-only (per explicit product direction — no Qwen/Groq fallback
+    for this one; if Mistral isn't configured or fails, subcomponents are
+    simply empty, never fabricated). Best-effort: any failure returns an
+    empty list rather than failing plan conversion, matching how every other
+    advisory stream in this file degrades.
+    """
+    mistral_key = os.environ.get("MISTRAL_API_KEY")
+    if not mistral_key:
+        return []
+    try:
+        raster = load_raster(source, page=page)
+        prep = preprocess(raster.rgb)
+        labels = [t["text"] for t in text_labels if t.get("text")]
+        return identify_subcomponents_via_mistral(prep.display_rgb, mistral_key, labels)
+    except Exception:  # noqa: BLE001 - advisory stream must not fail the request
+        return []
 
 
 def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) -> dict:

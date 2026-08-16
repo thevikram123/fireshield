@@ -321,6 +321,54 @@ test('floorplan conversion calls protected Qwen service then GPT-OSS NBCS assess
   assert.equal(groqPayload.reasoning_effort, 'low');
 });
 
+test('plan compliance forwards geometricModel (staircase subcomponent included) to the reasoning payload', async (t) => {
+  // geometricModel.subcomponents is the ONLY source anywhere in this system
+  // that can report a staircase — neither the deterministic wall tracer nor
+  // the dropped geometric symbol matcher ever recognized one (see
+  // worker/floorplan/symbol_lab/README.md). This locks in that it actually
+  // reaches the reasoning model rather than being silently dropped, the same
+  // class of bug that lost the walls array earlier in this project's history.
+  let groqPayload;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url) === 'https://floorplan.test/convert') {
+      return Response.json({
+        buildingProfile: { occupancy: 'Residential' },
+        topology: {
+          units: 'mm', mm_per_px: 10,
+          walls: [{ id: 'wall_28', start: [0, 0], end: [100, 0] }],
+          rooms: [], room_graph: { nodes: [], edges: [] },
+        },
+        geometricModel: {
+          wallIntersections: [{ wallA: 'wall_28', wallB: 'wall_11', kind: 'corner' }],
+          dimensions: [{ value: 2.0, wallId: 'wall_28', distanceMm: 45.0, resolved: true }],
+          subcomponents: [{
+            type: 'staircase', label: 'Staircase', confidence: 0.95,
+            sourceHint: 'uP', adjacentWallIds: ['wall_11', 'wall_28'],
+          }],
+        },
+        metrics: { walls: 1, rooms: 0 }, artifacts: {},
+      });
+    }
+    groqPayload = JSON.parse(options.body);
+    return Response.json({
+      choices: [{ message: { content: JSON.stringify({
+        planSummary: 'Staircase noted.', score: null, findings: [], citedClauses: [], limitations: [],
+      }) } }],
+    });
+  });
+  const form = new FormData();
+  form.append('file', new Blob(['plan'], { type: 'image/png' }), 'plan.png');
+  const response = await worker.fetch(new Request('https://worker.test/plan/convert', {
+    method: 'POST', headers: { Origin: origin }, body: form,
+  }), env());
+  assert.equal(response.status, 200);
+  const sentContent = groqPayload.messages[1].content;
+  assert.match(sentContent, /staircase/);
+  assert.match(sentContent, /"sourceHint":"uP"/);
+  assert.match(sentContent, /"wallA":"wall_28"/);
+  assert.match(sentContent, /"wallId":"wall_28"/);
+});
+
 test('plan compliance uses Mistral as primary for both the hop loop and final verdict, never touching Groq', async (t) => {
   let mistralFinalPayload = null;
   t.mock.method(globalThis, 'fetch', async (url, options) => {

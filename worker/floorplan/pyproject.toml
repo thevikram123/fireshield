@@ -12,6 +12,11 @@ dependencies = [
   "pymupdf>=1.24",
   "ezdxf>=1.3",
   "pillow>=10.0",
+  # Offline word-frequency dictionary (bundled data, no network/model
+  # download at runtime) — used by text_clustering.py to tell a real OCR
+  # label from noise/garbage without relying on Tesseract's own confidence
+  # score, which doesn't reliably separate the two on these drawings.
+  "pyspellchecker>=0.8",
 ]
 
 [project.optional-dependencies]

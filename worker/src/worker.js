@@ -562,6 +562,10 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
   context.plan.exteriorBoundary = context.plan.exteriorBoundary.slice(0, 20);
   context.plan.roomGraph.nodes = context.plan.roomGraph.nodes.slice(0, 50);
   context.plan.roomGraph.edges = context.plan.roomGraph.edges.slice(0, 80);
+  if (context.plan.geometricModel) {
+    context.plan.geometricModel.wallIntersections = context.plan.geometricModel.wallIntersections.slice(0, 40);
+    context.plan.geometricModel.dimensions = context.plan.geometricModel.dimensions.slice(0, 30);
+  }
   context.nbcsGuidance = context.nbcsGuidance.map((group) => ({
     ...group,
     results: (group.results || []).slice(0, 2).map((result) => ({
@@ -612,6 +616,14 @@ function fitPlanReasoningContext(plan, guidance, maxChars = 12_000) {
   context.plan.windows = [];
   context.plan.objects = [];
   context.plan.roomGraph = { nodes: [], edges: [] };
+  if (context.plan.geometricModel) {
+    context.plan.geometricModel.wallIntersections = [];
+    context.plan.geometricModel.dimensions = context.plan.geometricModel.dimensions.slice(0, 10);
+    // subcomponents (staircase included) is the one field in geometricModel
+    // that survives even this harshest trim, uncut — it's the ONLY source
+    // anywhere in this system that can report a staircase exists, and it's
+    // already small (a handful of furniture/fixture entries per plan).
+  }
   context.nbcsGuidance = context.nbcsGuidance.map((group) => ({
     question: group.question,
     results: (group.results || []).slice(0, 1),
@@ -764,6 +776,37 @@ function compactPlanForReasoning(converted) {
           type: String(edge.type || '').slice(0, 80),
         } : String(edge).slice(0, 160)) : [],
     },
+    // Wall-intersection graph, OCR dimensions resolved to their specific
+    // wall (not just a printed number floating unattached), and Mistral-
+    // identified subcomponents (furniture/fixtures/staircase, each with its
+    // grid position and which wall(s) it's adjacent to) — the explicit,
+    // ID-linked facts this reasoning step previously had to infer or lacked
+    // entirely. Notably: this is the ONLY signal anywhere in the pipeline
+    // that can surface a staircase/egress route — neither the deterministic
+    // wall tracer nor the (dropped) geometric symbol matcher ever
+    // recognized one; see worker/floorplan/symbol_lab/README.md.
+    geometricModel: (() => {
+      const gm = converted?.geometricModel;
+      if (!gm || typeof gm !== 'object') return null;
+      return {
+        wallIntersections: Array.isArray(gm.wallIntersections)
+          ? gm.wallIntersections.slice(0, 80).map((x) => ({
+            wallA: x.wallA, wallB: x.wallB, kind: x.kind,
+          })) : [],
+        dimensions: Array.isArray(gm.dimensions)
+          ? gm.dimensions.filter((d) => d?.resolved).slice(0, 60).map((d) => ({
+            value: d.value, wallId: d.wallId, distanceMm: d.distanceMm,
+          })) : [],
+        subcomponents: Array.isArray(gm.subcomponents)
+          ? gm.subcomponents.slice(0, 60).map((s) => ({
+            type: String(s.type || '').slice(0, 40),
+            label: String(s.label || '').slice(0, 120),
+            confidence: Number(s.confidence) || null,
+            sourceHint: s.sourceHint ? String(s.sourceHint).slice(0, 80) : null,
+            adjacentWallIds: Array.isArray(s.adjacentWallIds) ? s.adjacentWallIds.slice(0, 6) : [],
+          })) : [],
+      };
+    })(),
   };
 }
 
@@ -1494,6 +1537,20 @@ const PLAN_REASON_SYSTEM =
   + 'advisory, still mark absolute door/window WIDTHS as cannot_verify unless plan.doors/windows independently '
   + 'confirms a measured width — but exit count, presence and connectivity must be assessed from visionOpenings '
   + 'rather than marked cannot_verify for no reason. '
+  + '`plan.geometricModel` (when present) adds three things nothing else in this payload provides: '
+  + 'wallIntersections (which wall meets which, and how — corner/t_junction/cross — for tracing an actual '
+  + 'egress path through the building rather than assuming rooms connect); dimensions (an OCR-read measurement '
+  + 'already resolved to the SPECIFIC wallId it measures, e.g. a printed "1.20" tied to wall_7 — prefer this '
+  + 'over an inferred/scaled measurement when both exist, since it is a printed value, not a pixel estimate); '
+  + 'and subcomponents, a Mistral vision read of furniture/fixtures INCLUDING staircases (type "staircase"), '
+  + 'each with a confidence, which OCR label near it prompted the read (sourceHint), and which wall(s) it sits '
+  + 'against. CRITICAL: subcomponents is the ONLY source anywhere in this system that can tell you a staircase '
+  + 'exists — plan.walls/doors/windows and visionOpenings never detect stairs. Always check subcomponents for '
+  + 'a "staircase" entry before concluding on egress/means-of-escape findings; a building with only one storey '
+  + 'accessible and no staircase present may have different egress requirements than one with an unreported '
+  + 'stair, so treat an absent staircase entry as cannot_verify for vertical-egress checks, not as proof there '
+  + 'is none. subcomponents entries are vision-advisory (confidence-scored, not deterministic) — cite them as '
+  + 'observed evidence but do not treat a low-confidence entry as certain. '
   + 'Identify which fire-safety systems and life-safety checks this specific geometry implicates (exit count and '
   + 'width, travel distance, corridor width, compartmentation, detection/sprinkler coverage, refuge area, etc.), '
   + 'then use the query_nbc tool to fetch the exact NBCS requirement for each — including a specific measured '

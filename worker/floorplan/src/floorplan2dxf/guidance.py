@@ -643,6 +643,74 @@ def specify_via_mistral(
     raise RuntimeError("Mistral request failed after retry")
 
 
+def subcomponent_prompt(ocr_labels: list[str]) -> str:
+    """OCR label hints (room names, "UP", etc. — already cleaned/merged by
+    text_clustering.py) are folded into the prompt so Mistral cross-checks
+    its own vision read against what the drawing's own text says is there,
+    rather than guessing purely from shape. Explicitly calls out stairs/
+    egress: neither the deterministic CV pipeline nor a tried-and-dropped
+    geometric symbol matcher (see symbol_lab/README.md) ever recognized a
+    staircase, which is the one subcomponent category with direct fire-
+    safety/egress relevance — this prompt is the fix for that blind spot."""
+    labels_line = ", ".join(f'"{l}"' for l in ocr_labels) if ocr_labels else "(none read)"
+    return (
+        "This is an architectural floor plan drawing. Identify every furniture/fixture "
+        "SUBCOMPONENT you can see drawn on it — tables, beds, sofas/chairs, cabinets, "
+        "kitchen counters/sinks, bathroom fixtures (WC/sink/shower), and STAIRCASES "
+        "(look for a set of parallel step lines, often with a direction arrow or an "
+        "\"UP\"/\"DN\" label) — a staircase is a fire-safety/egress-relevant feature and "
+        "must be reported if present, even if you are not fully certain. "
+        f"Text already read off this drawing by OCR (room names, direction labels): "
+        f"{labels_line}. Use these as hints for what a shape near that text label probably "
+        "is, but still report only what you can actually see drawn. "
+        "Return JSON only: {\"subcomponents\": [{\"type\": string (e.g. \"bed\", \"sofa\", "
+        "\"dining_table\", \"kitchen_sink\", \"staircase\", \"wc\", \"cabinet\"), "
+        "\"label\": string (short human description), "
+        "\"positionFraction\": [x, y] (the item's approximate center, as a fraction 0.0-1.0 "
+        "of the image width and height), \"sourceHint\": string or null (which OCR label, if "
+        "any, is near this item), \"confidence\": number 0.0-1.0}]}. "
+        "Do not invent items that aren't actually drawn; if you're unsure of an item's exact "
+        "type, still report it with a lower confidence rather than omitting it."
+    )
+
+
+def identify_subcomponents_via_mistral(
+    rgb: np.ndarray, api_key: str, ocr_labels: list[str],
+    model: str = MISTRAL_DIMENSION_MODEL, max_tokens: int = 2000,
+) -> list[dict]:
+    """Mistral vision identification of furniture/fixture/staircase
+    subcomponents, with OCR label hints. Returns a list of
+    {type, label, positionFraction, sourceHint, confidence} dicts —
+    positionFraction is converted to pixel coordinates and resolved to the
+    nearest wall(s) by geometric_model.attach_subcomponents(), not here,
+    keeping this function a pure vision call with no geometry dependency."""
+    prompt = subcomponent_prompt(ocr_labels)
+    for attempt in range(2):
+        attempt_prompt = prompt
+        if attempt:
+            attempt_prompt = prompt + (
+                " Your previous reply was cut off or invalid. Return a SHORTER, complete "
+                "JSON object — fewer subcomponents if needed, but valid JSON."
+            )
+        try:
+            text = _mistral_request(
+                api_key, model, rgb, attempt_prompt, max_tokens, {"type": "json_object"})
+            parsed = json.loads(text or "{}")
+            items = parsed.get("subcomponents", [])
+            return [item for item in items if isinstance(item, dict) and item.get("type")]
+        except urllib.error.HTTPError as exc:
+            if attempt == 0:
+                continue
+            _, message = _provider_error_details(exc)
+            suffix = f": {message}" if message else ""
+            raise RuntimeError(f"Mistral request failed ({exc.code}){suffix}") from exc
+        except json.JSONDecodeError:
+            if attempt == 0:
+                continue
+            raise RuntimeError("Mistral request failed: reply was not valid JSON after retry")
+    raise RuntimeError("Mistral request failed after retry")
+
+
 def _bounded_confidence(value) -> float:
     try:
         return max(0.0, min(float(value), 1.0))
