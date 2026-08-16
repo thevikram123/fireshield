@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -159,8 +160,8 @@ class QwenTopologyGuide:
         )
         try:
             return _qwen_dimension_lines(self.api_key, self.model, rgb, prompt, max_tokens=900)
-        except Exception as exc:  # noqa: BLE001 - scale recovery is best-effort, never fatal
-            return {"_error": str(exc)[:300]}  # TEMP DIAGNOSTIC, see _qwen_dimension_lines
+        except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
+            return {}
 
     def _capture_review(self, payload: dict, initial: bool) -> None:
         review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
@@ -350,11 +351,20 @@ def _downscale_for_vision(rgb: np.ndarray, max_side: int = QWEN_MAX_SIDE) -> np.
     )
 
 
+#: Firing two Qwen calls per plan (specify() then read_dimensions()) can
+#: collide with the org's own TPM/TPD budget — observed live: the second call
+#: 429'd immediately after the first succeeded. Unlike worker.js's callGroq,
+#: this path had no retry at all, so any such collision silently killed scale
+#: recovery for the whole request. One bounded wait-and-retry, honouring
+#: Groq's own Retry-After, matches what the Worker already does.
+_MAX_RATE_LIMIT_WAIT_SECONDS = 12.0
+
+
 def _qwen_request(
     api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int,
     response_format: dict | None,
 ) -> str:
-    """Encode the image and image+prompt, return the raw text content."""
+    """Encode the image and prompt, return the raw text content."""
     rgb = _downscale_for_vision(rgb)
     ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
     if not ok:
@@ -375,20 +385,44 @@ def _qwen_request(
     }
     if response_format is not None:
         payload["response_format"] = response_format
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "FireShield-Floorplan/1.0",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as response:
-        result = json.load(response)
-    return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "FireShield-Floorplan/1.0",
+    }
+    for attempt in range(2):
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions", data=body, headers=headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                result = json.load(response)
+            return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except urllib.error.HTTPError as exc:
+            # Only 429 is handled here, by waiting and retrying once. Every
+            # other status (including 400/json_validate_failed) is re-raised
+            # AS THE ORIGINAL HTTPError, unmodified — _qwen_json's own retry
+            # depends on catching that exact exception type and reading its
+            # Groq error code, so this must not wrap or swallow it.
+            if exc.code == 429 and attempt == 0:
+                wait = _retry_after_seconds(exc)
+                if wait is not None and 0 < wait <= _MAX_RATE_LIMIT_WAIT_SECONDS:
+                    time.sleep(wait)
+                    continue
+            raise
+    raise RuntimeError("Qwen request failed after rate-limit retry")
+
+
+def _retry_after_seconds(error: urllib.error.HTTPError) -> float | None:
+    header = error.headers.get("Retry-After") if error.headers else None
+    if not header:
+        return None
+    try:
+        return float(header)
+    except (TypeError, ValueError):
+        return None
 
 
 def _qwen_json(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
@@ -455,14 +489,7 @@ def _qwen_dimension_lines(api_key: str, model: str, rgb: np.ndarray, prompt: str
         overall_match = _OVERALL_LINE.match(line)
         if overall_match:
             overall_w, overall_h = float(overall_match.group("w")), float(overall_match.group("h"))
-    # TEMP DIAGNOSTIC (remove once scale recovery is confirmed live): the raw
-    # reply, so a failure to parse is distinguishable from Qwen genuinely not
-    # producing the requested format, without needing another live round trip
-    # to find out which.
-    return {
-        "dimensions": dimensions, "overall_width_m": overall_w, "overall_height_m": overall_h,
-        "_raw": text[:600],
-    }
+    return {"dimensions": dimensions, "overall_width_m": overall_w, "overall_height_m": overall_h}
 
 
 def _bounded_confidence(value) -> float:

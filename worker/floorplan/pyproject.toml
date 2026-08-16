@@ -15,7 +15,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ocr = ["easyocr>=1.7"]
+# Tesseract is the default OCR path: it needs no PyTorch, loads no model
+# weights into memory, and the tesseract-ocr binary itself is ~30MB — the
+# entire memory-per-request constraint that kept EasyOCR disabled on the
+# 512MB Render plan doesn't apply. It reads clean printed dimension labels
+# ("2.00", "SCALE 1:100 MTS.") well, which is all this pipeline needs.
+ocr = ["pytesseract>=0.3.10"]
+# Kept available but not installed by default: heavier (pulls in PyTorch),
+# and was disabled at runtime for exactly that reason. Only worth it if
+# Tesseract's accuracy proves insufficient on a real drawing.
+ocr-easyocr = ["easyocr>=1.7"]
 recognizer = ["torch>=2.1", "gdown>=5.0"]
 dev = ["pytest>=8.0"]
 service = ["fastapi>=0.115", "python-multipart>=0.0.20", "uvicorn>=0.34"]
