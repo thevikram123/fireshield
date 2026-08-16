@@ -1184,7 +1184,19 @@ const REASON_SYSTEM =
   + 'the tool results. Call query_nbc once per system before concluding.';
 
 const FINAL_INSTRUCTION =
-  'Now output the final compliance assessment as JSON only, no prose, in this shape: '
+  // Observed live, twice: gpt-oss attempted a tool call on this final turn
+  // even with tool_choice:'none' and no `tools` array present, and even with
+  // NO prior tool-calling turns in the message history at all (the hop had
+  // degraded before calling anything) — so the trigger isn't the message
+  // history pattern this session originally assumed, it's more likely
+  // REASON_SYSTEM's own "Call query_nbc..." instruction still steering the
+  // model on this turn. An explicit override here is the fix, not more
+  // history-cleaning.
+  'Tool calling is now disabled for this response — you cannot call query_nbc or any '
+  + 'other tool here, regardless of what the earlier instructions said. If a check has '
+  + 'no tool result to cite, mark it cannot_verify; do not attempt to call a tool to get '
+  + 'one. '
+  + 'Now output the final compliance assessment as JSON only, no prose, in this shape: '
   + '{"occupancySummary": string, "score": number (0-100 overall compliance), '
   + '"findings": [{"system": string, "status": "compliant"|"gap"|"critical_gap"|"cannot_verify", '
   + '"severity": "minor"|"major"|"critical", "observed": string, "required": string, '

@@ -526,6 +526,11 @@ test('groqReason uses Mistral as primary when MISTRAL_API_KEY is configured and 
   const mistralPayload = seenPayloads[mistralIndex];
   assert.equal(mistralPayload.model, 'mistral-medium-latest');
   assert.deepEqual(mistralPayload.response_format, { type: 'json_object' });
+  // Live-observed twice: gpt-oss attempted a tool call on the final
+  // tool_choice:'none' turn even with an empty tool-call history — the fix
+  // is an explicit counter-instruction on this turn, not just history
+  // sanitization. Lock in that it actually reaches the final call.
+  assert.ok(mistralPayload.messages.some((m) => String(m.content).includes('Tool calling is now disabled')));
 });
 
 test('groqReason falls back to Groq when MISTRAL_API_KEY is configured but Mistral fails', async (t) => {
