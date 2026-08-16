@@ -756,6 +756,62 @@ test('computeComplianceScore is deterministic for identical findings regardless 
   assert.ok(Math.abs(first.score - 28.33) < 0.01);
 });
 
+test('a verdict covering fewer findings than detected equipment types is retried, naming what was dropped', async (t) => {
+  // Live-observed: P4 detected 4 equipment types, but the final verdict only
+  // covered 2 of them — silently dropping equipment the previous phase
+  // actually found. The audit must not move forward on that; it gets one
+  // corrective retry naming the exact gap before either recovering or failing.
+  let mistralCalls = 0;
+  let secondCallContent = '';
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url).includes('api.mistral.ai')) {
+      mistralCalls++;
+      if (mistralCalls === 1) {
+        return Response.json({ choices: [{ message: { content: JSON.stringify({
+          occupancySummary: 'Partial audit', score: 50,
+          findings: [{
+            system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
+            observed: '1 observed', required: 'per Table 7', clauseId: '', page: null,
+            rationale: 'ok',
+          }],
+          citedClauses: [],
+        }) } }] });
+      }
+      const userMsgs = JSON.parse(options.body).messages.filter((m) => m.role === 'user');
+      secondCallContent = String(userMsgs[userMsgs.length - 1]?.content || '');
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Complete audit', score: 50,
+        findings: [
+          { system: 'Fire Extinguisher', status: 'compliant', severity: 'minor', observed: '1', required: 'x', clauseId: '', page: null, rationale: 'ok' },
+          { system: 'Sprinkler Head', status: 'critical_gap', severity: 'critical', observed: '0', required: 'x', clauseId: '', page: null, rationale: 'ok' },
+          { system: 'Smoke Detector', status: 'critical_gap', severity: 'critical', observed: '0', required: 'x', clauseId: '', page: null, rationale: 'ok' },
+        ],
+        citedClauses: [],
+      }) } }] });
+    }
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', {
+      buildingProfile: {},
+      detected: [
+        { type: 'extinguisher', count: 1, condition: 'good' },
+        { type: 'sprinkler', count: 0, condition: 'unknown' },
+        { type: 'smoke_detector', count: 0, condition: 'unknown' },
+      ],
+      docs: [],
+    }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(mistralCalls, 2, 'a short verdict triggers exactly one corrective retry');
+  assert.ok(secondCallContent.includes('only covered 1 of the 3'), 'the retry names the exact coverage gap');
+  const body = await response.json();
+  assert.equal(body.findings.length, 3);
+});
+
 test('groqReason folds a zones array into the reasoning context and instructs per-zone grading', async (t) => {
   let userContent = '';
   t.mock.method(globalThis, 'fetch', async (url, options) => {

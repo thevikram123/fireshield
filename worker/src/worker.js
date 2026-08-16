@@ -53,7 +53,15 @@ const MISTRAL_TPM_BUDGET = 20_000;
 // plus output still stays under the 8000/min cap.
 const PLAN_FINAL_MAX_TOKENS = 1600;
 const REASON_HOP_MAX_TOKENS = 700;
-const REASON_FINAL_MAX_TOKENS = 1600;
+// groqReason's final verdict is Mistral-only now (25,000 TPM budget — see
+// MISTRAL_TPM_BUDGET), not the Groq-shared value this used to inherit. 1600
+// was sized for Groq's tight 8000/min cap and silently truncated the JSON
+// output mid-object once a building had ~5+ equipment types worth of
+// findings, each with a full rationale string — the model wasn't wrong, it
+// ran out of completion budget and the tail of the JSON (later findings)
+// never got written. 20,000 - this still leaves ~16k tokens of input budget,
+// far more than a single audit's context needs.
+const REASON_FINAL_MAX_TOKENS = 4000;
 const TOOL_RESULT_MAX_CHARS = 1500;
 
 // Groq bills whole tokens; ~4 chars/token is the standard rough estimate and
@@ -868,6 +876,12 @@ async function groqReason(request, env, cors, apiKey) {
     detected: Array.isArray(z?.detected) ? z.detected.slice(0, 40) : [],
   })) : [];
   const allDetected = zones.length ? [...detected, ...zones.flatMap((z) => z.detected)] : detected;
+  // Every distinct type detected in P4 must be acknowledged by a finding in
+  // the final verdict — the audit must not silently move forward having
+  // dropped equipment the previous phase actually found. Used below as a
+  // hard floor on the verdict's finding count, not just a shape check.
+  const distinctDetectedTypeCount = new Set(
+    allDetected.map((item) => String(item?.type || '')).filter(Boolean)).size;
   const observedTypes = [...new Set(allDetected.map((item) => String(item?.type || '')))]
     .filter((type) => VISUAL_GUIDANCE_QUERIES[type])
     .slice(0, 8);
@@ -1006,13 +1020,33 @@ async function groqReason(request, env, cors, apiKey) {
       content: (reasonFindings ? `NBCS lookup results:\n${reasonFindings}\n\n` : '') + FINAL_INSTRUCTION,
     },
   ];
-  const shapeRetryMessages = (msgs) => [...msgs, {
-    role: 'user',
-    content: 'Your previous reply did not match the required JSON shape (missing/empty '
-      + '"findings", a finding missing a valid "status"/"severity" enum value, or the JSON '
-      + 'itself was truncated/malformed). Return the SAME assessment again as one complete, '
-      + 'valid JSON object matching the shape exactly — keep it compact if you were cut off.',
-  }];
+  // The verdict must acknowledge every distinct equipment type P4 detected —
+  // the audit must not silently move forward having dropped something the
+  // previous phase actually found. Finding count is a coarse but effective
+  // proxy: FINAL_INSTRUCTION requires one finding per detectedEquipment item
+  // (plus any undetected-but-mandatory systems), so a valid, complete verdict
+  // can never have FEWER findings than distinct detected types.
+  const isComplete = (verdict) =>
+    isValidVerdict(verdict) && verdict.findings.length >= distinctDetectedTypeCount;
+
+  const shapeRetryMessages = (msgs, verdict) => {
+    const short = verdict && Array.isArray(verdict.findings)
+      && verdict.findings.length < distinctDetectedTypeCount;
+    return [...msgs, {
+      role: 'user',
+      content: short
+        ? `Your previous reply only covered ${verdict.findings.length} of the `
+          + `${distinctDetectedTypeCount} distinct equipment types already detected in this `
+          + 'conversation\'s detectedEquipment/zones data. Every one of them needs its own '
+          + 'finding — you may not silently drop any. Return the SAME assessment again, this '
+          + 'time with a finding for every detected type (plus any undetected-but-mandatory '
+          + 'systems). Keep rationales short if you were running out of room.'
+        : 'Your previous reply did not match the required JSON shape (missing/empty '
+          + '"findings", a finding missing a valid "status"/"severity" enum value, or the JSON '
+          + 'itself was truncated/malformed). Return the SAME assessment again as one complete, '
+          + 'valid JSON object matching the shape exactly — keep it compact if you were cut off.',
+    }];
+  };
 
   async function callMistralFinal(msgs) {
     return callMistral(mistralKey, {
@@ -1025,25 +1059,27 @@ async function groqReason(request, env, cors, apiKey) {
       response_format: { type: 'json_object' },
     });
   }
-  // Retry once, correcting for EITHER failure mode: (a) the call itself
-  // errored because the provider's own generation/validation rejected the
-  // output (e.g. Groq/Mistral "failed to generate JSON" / truncated output —
-  // this used to skip the retry entirely and surface the raw provider error
-  // to the client), or (b) the call succeeded (200) but the parsed JSON didn't
-  // match our shape (the "incompatible json" symptom). A genuine outage
-  // (429/5xx/auth) is not retried here — callMistral already retries once on
-  // 429 internally, and re-asking won't fix an auth/5xx failure.
+  // Retry once, correcting for any of THREE failure modes: (a) the call
+  // itself errored because the provider's own generation/validation rejected
+  // the output (e.g. Groq/Mistral "failed to generate JSON" / truncated
+  // output — this used to skip the retry entirely and surface the raw
+  // provider error to the client), (b) the call succeeded (200) but the
+  // parsed JSON didn't match our shape (the "incompatible json" symptom), or
+  // (c) the shape was valid but the model dropped equipment the previous
+  // phase actually detected. A genuine outage (429/5xx/auth) is not retried
+  // here — callMistral already retries once on 429 internally, and
+  // re-asking won't fix an auth/5xx failure.
   async function attempt(callFn, msgs) {
     let data = await callFn(msgs);
     let verdict = (!data || data.error) ? null : safeJson(data.json?.choices?.[0]?.message?.content);
-    if (isValidVerdict(verdict)) return { data, verdict };
+    if (isComplete(verdict)) return { data, verdict };
     const isRetryableGenerationFailure = data?.error
       && data.status === 400
       && /json_validate_failed|failed to generate json/i.test(`${data.code} ${data.error}`);
     if (data?.error && !isRetryableGenerationFailure) return { data, verdict: null };
-    data = await callFn(shapeRetryMessages(msgs));
+    data = await callFn(shapeRetryMessages(msgs, verdict));
     verdict = (!data || data.error) ? null : safeJson(data.json?.choices?.[0]?.message?.content);
-    return { data, verdict: isValidVerdict(verdict) ? verdict : null };
+    return { data, verdict: isComplete(verdict) ? verdict : null };
   }
 
   const { data: finalData, verdict } = await attempt(callMistralFinal, rawFinalMessages);
@@ -1053,8 +1089,9 @@ async function groqReason(request, env, cors, apiKey) {
       finalData?.status || 502, { ...cors, ...(finalData?.headers || {}) });
   }
   if (!verdict) {
-    return json({ error: 'compliance verdict returned an invalid shape after retry' }, 502,
-      { ...cors, ...finalData.headers });
+    return json({ error: 'compliance verdict returned an invalid or incomplete shape after '
+      + 'retry — either malformed JSON or it still did not cover every detected equipment type' },
+      502, { ...cors, ...finalData.headers });
   }
 
   // Score must not be a freeform model guess — that's what let the SAME image
@@ -1333,6 +1370,13 @@ const FINAL_INSTRUCTION =
   + 'list already provided in this conversation, evaluated against its queried requirement, or '
   + '(b) a mandatory system for this occupancy/height/area with zero matching detections, marked '
   + 'critical_gap. Do not invent findings for systems that are neither detected nor mandatory. '
+  + 'CRITICAL: "status" and "required" must never contradict each other. If the tool result says '
+  + 'a system is NOT REQUIRED / NR for this occupancy (e.g. Table 7 marks it "NR"), the status must '
+  + 'be "compliant" (trivially satisfied — nothing was mandated), never "gap" or "critical_gap", '
+  + 'even if the system happens to be present or absent in the photos. Reserve "gap"/"critical_gap" '
+  + 'strictly for systems the tool results say ARE required (R) but were not sufficiently observed. '
+  + 'EVERY item in detectedEquipment must produce exactly one finding — do not silently omit any of '
+  + 'them from the findings array.'
   + 'The "score" field you output is informational only and will be recalculated '
   + 'server-side from your findings — it does not need to be precise, but findings/status/severity must be.';
 
