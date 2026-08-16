@@ -104,3 +104,65 @@ def attach_subcomponents(model: dict, subcomponents: list[dict],
             ]
         resolved.append(entry)
     model["subcomponents"] = resolved
+
+
+def attach_openings(
+    model: dict, mistral_openings: list[dict], image_size_px: tuple[int, int],
+    mm_per_px: float | None, deterministic_doors: list[dict], deterministic_windows: list[dict],
+) -> None:
+    """Cross-checks Mistral's vision read of door/window symbols against the
+    deterministic CV opening detector's own output (openings.py), and adds
+    an "openings" key to an already-built model dict — never edits
+    `deterministic_doors`/`deterministic_windows` themselves, since those
+    still carry the only real, pixel-measured widths this system has.
+
+    Each vision-identified opening is flagged `confirmedByGeometry: bool` —
+    within a generous match radius (4% of the image's own longer side, since
+    a vision model's positionFraction is a rough estimate, not a precise
+    pixel read) of a deterministically-traced opening of the SAME kind. A
+    `false` here is the signal worth acting on: it means the drawing visibly
+    has a door/window symbol the deterministic pass missed (a fragmented
+    wall network confused its perimeter search, or the drawing's line
+    weights didn't give it a thickness signal to work with — both real,
+    confirmed failure modes on real plans this session, not hypothetical).
+    The compliance reasoning step is instructed to treat those as evidence
+    of at least one more opening than the traced count, not to invent a
+    width for it (see PLAN_REASON_SYSTEM in worker.js).
+    """
+    from .grid import dist_point_to_segment, grid_spec_for_image
+    import math
+
+    img_w, img_h = image_size_px
+    grid_spec = grid_spec_for_image((img_h, img_w), mm_per_px=mm_per_px)
+    walls = model.get("walls", [])
+    match_px = max(img_w, img_h) * 0.04
+    det_centers: dict[str, list[tuple[float, float]]] = {"door": [], "window": []}
+    for door in deterministic_doors:
+        center = door.get("center")
+        if center:
+            det_centers["door"].append((float(center[0]), float(center[1])))
+    for window in deterministic_windows:
+        center = window.get("center")
+        if center:
+            det_centers["window"].append((float(center[0]), float(center[1])))
+
+    resolved = []
+    for item in mistral_openings:
+        kind = item.get("kind")
+        frac = item.get("positionFraction")
+        entry = {"kind": kind, "confidence": item.get("confidence")}
+        if frac and len(frac) == 2 and kind in det_centers:
+            pos_px = (float(frac[0]) * img_w, float(frac[1]) * img_h)
+            entry["position"] = annotate_position(grid_spec, pos_px)
+            nearest_wall, nearest_dist = None, None
+            for wall in walls:
+                dist = dist_point_to_segment(pos_px, tuple(wall["start"]["px"]), tuple(wall["end"]["px"]))
+                if nearest_dist is None or dist < nearest_dist:
+                    nearest_wall, nearest_dist = wall["id"], dist
+            entry["nearestWallId"] = nearest_wall
+            entry["confirmedByGeometry"] = any(
+                math.hypot(pos_px[0] - cx, pos_px[1] - cy) <= match_px
+                for cx, cy in det_centers[kind]
+            )
+        resolved.append(entry)
+    model["openings"] = resolved

@@ -138,7 +138,7 @@ def convert(
     if not plan.doors and not plan.windows:
         try:
             for index, opening in enumerate(
-                detect_openings(prep.display_rgb, prep.wall_mask, cv_geom.walls)
+                detect_openings(prep.display_rgb, prep.wall_mask, cv_geom.walls_for_openings)
             ):
                 if opening.kind == "door":
                     plan.doors.append(Door(

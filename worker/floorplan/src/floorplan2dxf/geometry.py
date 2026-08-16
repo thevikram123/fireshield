@@ -26,6 +26,19 @@ class CvGeometry:
     bars: list[DimensionBar] = field(default_factory=list)
     traces: list[VectorTrace] = field(default_factory=list)
     wall_mask: np.ndarray | None = None
+    # Opening detection (openings.py) was built and validated against a
+    # coarse, dominant-mass-only wall trace — a handful of long runs per
+    # side. `walls` above is deliberately more complete (keeps every real
+    # fragment so a wall broken by a window gap or a corner isn't dropped,
+    # see largest_structure()/clip_to_outer()), but feeding that fuller list
+    # to openings.py measurably hurt its accuracy: more candidate wall
+    # fragments means more competing "lines" for perimeter selection and
+    # more nearby-wall matches for arc detection, even though every extra
+    # fragment is real architecture. Keeping a separate, deliberately
+    # conservative wall list for openings.py specifically restores the
+    # input shape it was tuned against without discarding the completeness
+    # fix for everything else (DXF export, envelope, room sealing).
+    walls_for_openings: list[Wall] = field(default_factory=list)
 
 
 def extract_geometry(rgb: np.ndarray, wall_mask: np.ndarray) -> CvGeometry:
@@ -36,15 +49,45 @@ def extract_geometry(rgb: np.ndarray, wall_mask: np.ndarray) -> CvGeometry:
     linked = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, _kernel(dash), iterations=1)
     ink = keep_building_ink(linked)
     main = largest_structure(ink)
-    structure = clip_to_outer(cv2.bitwise_or(ink, seal_outer_loop(main, thickness=max(8, dash))), main)
-    sealed = cv2.morphologyEx(structure, cv2.MORPH_CLOSE, _kernel(door), iterations=1)
+    # This drawing's own typical gap between real architecture fragments
+    # (see _max_gap_to_connect) — the one distance measurement used both to
+    # decide how close a fragment must be to `main` to count as part of the
+    # building (clip_to_outer's `reach`) and how wide a window opening's
+    # closure ring needs to be for room sealing, below. Reusing a single
+    # image-measured value keeps both jobs consistent instead of guessing
+    # two different fixed constants.
+    reach = max(dash, _max_gap_to_connect(main) + 4)
+    # `structure` (walls/envelope) is real ink only, clipped to the building
+    # region — no fabricated pixels. `seal_outer_loop`'s closure ring is
+    # deliberately kept OUT of it and used only to build a separate mask for
+    # room flood-fill sealing, below. It used to be folded into `structure`
+    # itself (bitwise_or'd in before clip_to_outer), which meant widening the
+    # ring to bridge a real window gap also injected spurious "wall" ink into
+    # walls_from_mask/envelope/openings detection — confirmed directly:
+    # widening the ring enough to close a 34px window gap on a real 12-room
+    # plan spiked its door count from a correct ~5 to 25, because the ring
+    # itself was being traced as wall/door evidence. Sealing for room
+    # detection and tracing for real geometry are different jobs and must
+    # not share one mask. `structure` itself also used to clip with a fixed
+    # 15px reach regardless of `reach` above, which on a thin-outline-walled
+    # drawing let an isolated dimension/extension line (never part of the
+    # wall network) survive as its own kept contour once largest_structure()
+    # stopped filtering by relative size — confirmed directly: it threw off
+    # which traced line openings.py picked as the true exterior wall,
+    # spiking door count and losing every window on a real plan. Clipping
+    # `structure` with the same measured `reach` excludes it consistently.
+    structure = clip_to_outer(ink, main, reach=reach)
+    room_seal = clip_to_outer(cv2.bitwise_or(ink, seal_outer_loop(main, thickness=reach)), main, reach=reach)
+    sealed = cv2.morphologyEx(room_seal, cv2.MORPH_CLOSE, _kernel(door), iterations=1)
     walls = walls_from_mask(cv2.bitwise_or(ink, structure))
     rooms = rooms_from_mask(sealed)
     envelope = envelope_from_mask(structure)
     bars = find_dimension_bars(rgb)
     traces = trace_all_lines(rgb)
+    walls_for_openings = walls_from_mask(_dominant_mass(ink)) or walls
     return CvGeometry(
         walls=walls, rooms=rooms, envelope=envelope, bars=bars,
+        walls_for_openings=walls_for_openings,
         traces=traces, wall_mask=structure,
     )
 
@@ -54,37 +97,197 @@ def _kernel(n: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_RECT, (n, n))
 
 
-def clip_to_outer(mask: np.ndarray, seed: np.ndarray) -> np.ndarray:
+def _max_gap_to_connect(mask: np.ndarray, cap: int = 200) -> int:
+    """The widest TYPICAL edge-to-edge gap between this drawing's own ink
+    components — i.e. the largest opening (window/door) actually present in
+    the wall network, measured from the image instead of guessed.
+
+    Built from the minimum spanning tree over components (nearest-pixel
+    Euclidean distance as edge weight): the MST's edges are exactly the set
+    of gaps that have to be bridged to connect every component to its
+    nearest neighbour once, so most of them are real openings. But the
+    single largest MST edge is NOT a safe answer on its own — a lone stray
+    mark far from the building (a decorative plant/furniture icon that
+    slipped past keep_building_ink's shape/size floor) still has to connect
+    to *something* to complete the spanning tree, and its distance to the
+    nearest real component can dwarf every genuine window/door gap.
+    Confirmed directly on a real 12-room plan: 25 of 26 MST edges fell in
+    the 6-49px range (real openings), and exactly one — to an isolated tree
+    icon in a corner — was 150px; naively bridging that stretched the
+    closure kernel over 3x too wide and merged rooms that should have
+    stayed separate. IQR-based outlier rejection on the MST edge weights
+    themselves (computed from this drawing's own gap distribution, no fixed
+    cutoff) drops that kind of one-off outlier and keeps the largest gap
+    that's actually representative of this drawing's real openings.
+    """
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8) * 255, connectivity=8)
+    ids = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= 1]
+    if len(ids) <= 1:
+        return 0
+    if len(ids) > 60:  # too many fragments for O(n^2) distance transforms to be worth it
+        return cap
+    dist_maps = {}
+    for i in ids:
+        comp = np.where(labels == i, 0, 255).astype(np.uint8)
+        dist_maps[i] = cv2.distanceTransform(comp, cv2.DIST_L2, 5)
+    pts = {i: np.where(labels == i) for i in ids}
+    edges = []
+    for a_idx, a in enumerate(ids):
+        for b in ids[a_idx + 1:]:
+            gap = float(dist_maps[a][pts[b]].min())
+            edges.append((gap, a, b))
+    edges.sort(key=lambda e: e[0])
+    parent = {i: i for i in ids}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    mst_gaps = []
+    connected = 1
+    for gap, a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue
+        parent[ra] = rb
+        mst_gaps.append(gap)
+        connected += 1
+        if connected == len(ids):
+            break
+    if not mst_gaps:
+        return 0
+    if len(mst_gaps) < 4:  # too few samples for a meaningful quartile split
+        return min(cap, int(round(max(mst_gaps))))
+    arr = np.array(mst_gaps)
+    q1, q3 = np.percentile(arr, [25, 75])
+    upper_fence = q3 + 1.5 * (q3 - q1)
+    typical = arr[arr <= upper_fence]
+    widest = float(typical.max()) if typical.size else float(arr.min())
+    return min(cap, int(round(widest)))
+
+
+def clip_to_outer(mask: np.ndarray, seed: np.ndarray, reach: int = 15) -> np.ndarray:
+    """Clip `mask` to the region(s) near `seed`, rejecting ink far from any
+    of it (stray title-block/legend/dimension-line content). Fills ALL of
+    the dilated seed's external contours, not just the largest — same fix as
+    largest_structure() and for the same reason: `seed` (now
+    largest_structure's output) can legitimately be several geometrically
+    separate regions of one building, and a fixed-radius dilation isn't
+    guaranteed to merge distant ones into a single contour. Picking only the
+    biggest contour reproduced the exact same "silently drop half the
+    building" bug one level downstream even after largest_structure() itself
+    was fixed — confirmed directly: room count for a 12-room test plan
+    didn't improve until this was also fixed, despite the seed mask itself
+    already being correct by that point.
+
+    Keeping every contour cuts the other way if `reach` is too generous: a
+    dimension/extension line drawn just outside the building, or a stray
+    icon, is now its own separate contour too (once largest_structure()
+    stopped filtering by relative size) and gets kept wholesale rather than
+    excluded as "far". `reach` should be the drawing's own measured typical
+    gap between real architecture fragments (see `_max_gap_to_connect`), not
+    a fixed pixel constant — close enough to bridge a real window/door
+    opening, not so wide it also swallows content that was never part of the
+    wall network.
+    """
     fill = np.zeros_like(mask)
-    dilated = cv2.dilate(seed, _kernel(15), iterations=1)
+    dilated = cv2.dilate(seed, _kernel(max(3, reach)), iterations=1)
     cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return mask
-    cv2.drawContours(fill, [max(cnts, key=cv2.contourArea)], -1, 255, thickness=-1)
+    cv2.drawContours(fill, cnts, -1, 255, thickness=-1)
     return cv2.bitwise_and(mask, fill)
 
 
+def _dominant_mass(ink: np.ndarray) -> np.ndarray:
+    """Only the wall ink that clusters into the drawing's dominant mass(es)
+    — components at least 8% of the single largest one's area, clipped to
+    the single largest resulting contour.
+
+    This is deliberately the stricter, earlier version of
+    largest_structure()/clip_to_outer() (see their docstrings for why it was
+    loosened for the *general* wall trace: on a densely-fragmented plan it
+    drops real architecture). It exists only to build
+    CvGeometry.walls_for_openings — opening detection wants the same small,
+    dominant-only candidate set it was originally tuned against, not the
+    fuller trace, so this keeps that option available without re-loosening
+    (or re-tightening) the shared functions everything else depends on.
+    """
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((ink > 0).astype(np.uint8) * 255, connectivity=8)
+    candidates = [(i, int(stats[i, cv2.CC_STAT_AREA])) for i in range(1, n)]
+    if not candidates:
+        return np.zeros_like(ink)
+    max_area = max(area for _, area in candidates)
+    keep_ids = [i for i, area in candidates if area >= max_area * 0.08]
+    main = np.isin(labels, keep_ids).astype(np.uint8) * 255
+    dilated = cv2.dilate(main, _kernel(15), iterations=1)
+    cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return main
+    fill = np.zeros_like(main)
+    cv2.drawContours(fill, [max(cnts, key=cv2.contourArea)], -1, 255, thickness=-1)
+    return cv2.bitwise_and(main, fill)
+
+
 def largest_structure(mask: np.ndarray) -> np.ndarray:
+    """Keep every ink component large enough to plausibly be part of the
+    building, not just the single biggest one.
+
+    Root-caused via a real 12-room floor plan: its wall ink wasn't one
+    connected blob (a corner gap, a door swing arc, or a T-junction can
+    easily split a large building's outline into several separate
+    components), so picking only the single largest discarded the rest of
+    the building outright — confirmed directly: of 29 ink components on that
+    plan, only 1 (covering roughly a third of the total ink) survived the
+    old "pick one" logic, and everything downstream (room sealing, the
+    envelope) was clipped to just that fragment. A simpler test plan
+    happened to trace as one connected piece, so this went unnoticed there.
+
+    A first fix kept components >= 8% of the largest component's own area
+    (relative, not absolute). That itself turned out to make the same
+    mistake one level up: on a densely-partitioned plan the "largest"
+    component is just whichever room cluster happens to be tightly linked
+    (e.g. a block of bedrooms whose walls all touch at shared corners), not
+    a stand-in for "typical wall size" — real exterior-wall segments between
+    doors/windows are legitimately much smaller than that cluster and were
+    still being discarded wholesale (confirmed directly: on the same 12-room
+    plan, 26 of 37 real wall-ink components fell under an 8%-of-14241 cutoff,
+    including most of the exterior perimeter, which fragments into one piece
+    per opening rather than staying one blob). There is no component-count
+    threshold, relative or absolute, that is a valid proxy for "is this
+    architecture" across arbitrarily different room layouts.
+
+    keep_building_ink() already did the real filtering this function needs
+    (an absolute noise floor, and a shape check for the one specific
+    false-positive shape confirmed in practice: a wide, short, low-on-the-
+    page bar matching a title-block underline). Checked directly against
+    both test plans: every component that survives keep_building_ink is
+    wall-shaped (elongated bands and their L/T-junction unions), so no
+    additional size-based filtering step is safe to add without cutting into
+    real architecture again. This function now only re-applies that same
+    absolute/shape filter (redundant with keep_building_ink, kept here so it
+    holds even if called on a mask that skipped that step) instead of
+    picking components by their size relative to each other.
+    """
     work = (mask > 0).astype(np.uint8) * 255
     n, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
     h = work.shape[0]
-    best_i, best_score = 0, 0.0
+    keep_ids = []
     for i in range(1, n):
         area = int(stats[i, cv2.CC_STAT_AREA])
         ww = int(stats[i, cv2.CC_STAT_WIDTH])
         hh = int(stats[i, cv2.CC_STAT_HEIGHT])
         cy = int(stats[i, cv2.CC_STAT_TOP]) + hh / 2.0
         if hh < 25 and ww > 80 and cy > 0.78 * h:
-            continue
+            continue  # title-block underline shape, not architecture
         if area < 80:
             continue
-        score = float(ww * hh)
-        if score > best_score:
-            best_score = score
-            best_i = i
-    if best_i == 0:
+        keep_ids.append(i)
+    if not keep_ids:
         return work
-    return np.where(labels == best_i, 255, 0).astype(np.uint8)
+    return np.isin(labels, keep_ids).astype(np.uint8) * 255
 
 
 def keep_building_ink(mask: np.ndarray) -> np.ndarray:

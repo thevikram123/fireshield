@@ -822,6 +822,16 @@ function compactPlanForReasoning(converted) {
             sourceHint: s.sourceHint ? String(s.sourceHint).slice(0, 80) : null,
             adjacentWallIds: Array.isArray(s.adjacentWallIds) ? s.adjacentWallIds.slice(0, 6) : [],
           })) : [],
+        // Mistral's vision read of door/window symbols, cross-checked against
+        // the deterministic trace (attach_openings in geometric_model.py) —
+        // only the ones it flagged as NOT matching a traced opening are worth
+        // the model's attention, so only those are forwarded here. A traced
+        // opening always keeps its real measured width; this can only ever
+        // raise the effective count, never invent a width for the gap.
+        unconfirmedOpenings: Array.isArray(gm.openings)
+          ? gm.openings.filter((o) => o?.confirmedByGeometry === false).slice(0, 30).map((o) => ({
+            kind: o.kind, nearestWallId: o.nearestWallId, confidence: Number(o.confidence) || null,
+          })) : [],
       };
     })(),
   };
@@ -1568,9 +1578,20 @@ const PLAN_REASON_SYSTEM =
   + 'stair, so treat an absent staircase entry as cannot_verify for vertical-egress checks, not as proof there '
   + 'is none. subcomponents entries are vision-advisory (confidence-scored, not deterministic) — cite them as '
   + 'observed evidence but do not treat a low-confidence entry as certain. '
-  + 'IMPORTANT: use wallIntersections/dimensions/subcomponents only as EVIDENCE inside the existing finding '
-  + 'fields (observed, rationale, measurementEvidence) — the output JSON schema is fixed and already given below; '
-  + 'never add a new top-level field (no "subcomponents", "geometricModel", "staircase", etc.) to your response, '
+  + 'unconfirmedOpenings is a Mistral vision read of door/window symbols on the drawing that did NOT match any '
+  + 'entry already in plan.doors/plan.windows within a generous distance — i.e. a door or window the '
+  + 'deterministic detector likely missed (it depends on the traced wall network being clean and the drawing\'s '
+  + 'line weights giving it a thickness signal, both of which can fail on a real plan even though the symbol is '
+  + 'clearly visible). Treat plan.doors.length/plan.windows.length as a FLOOR, not the true count, when '
+  + 'unconfirmedOpenings has entries of that kind: for egress/opening-count findings, note that at least one '
+  + 'additional door/window is visibly present per each unconfirmed entry, but mark its WIDTH as cannot_verify '
+  + '(unconfirmedOpenings never carries a measured width — only plan.doors/windows do). Do not double count: an '
+  + 'unconfirmed entry is already known not to correspond to a traced one, so add it on top of the traced count, '
+  + 'never replace or re-derive plan.doors/plan.windows from it. '
+  + 'IMPORTANT: use wallIntersections/dimensions/subcomponents/unconfirmedOpenings only as EVIDENCE inside the '
+  + 'existing finding fields (observed, rationale, measurementEvidence) — the output JSON schema is fixed and '
+  + 'already given below; never add a new top-level field (no "subcomponents", "geometricModel", "staircase", '
+  + 'etc.) to your response, '
   + 'and never omit a required field. A finding about the staircase is still just one more entry in "findings" '
   + 'with a "check" like "Egress — staircase present", using the existing shape. '
   + 'Identify which fire-safety systems and life-safety checks this specific geometry implicates (exit count and '

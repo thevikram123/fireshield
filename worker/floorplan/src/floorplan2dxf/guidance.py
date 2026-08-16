@@ -711,6 +711,85 @@ def identify_subcomponents_via_mistral(
     raise RuntimeError("Mistral request failed after retry")
 
 
+def opening_prompt(ocr_labels: list[str]) -> str:
+    """Door/window identification, as a cross-check for the deterministic
+    CV opening detector (openings.py) rather than a replacement for it.
+
+    That detector reads real pixel geometry off the traced wall network
+    (swing-arc fitting for doors, hollow-run analysis for windows), which
+    this vision read can never match for precision — but it depends on the
+    traced wall list being clean enough to search, and on the drawing's own
+    line-weight convention actually making a wall thicker than a dimension
+    hairline. Both assumptions can fail on a real plan (a densely-fragmented
+    wall network, or a thin-outline drawing style where every line is the
+    same weight) in ways no CV threshold reliably self-corrects for — this
+    is exactly the kind of visual pattern read a vision model does natively
+    ("python can't see"; a human glancing at the drawing does this
+    instantly). Used only to check *coverage* (is a door/window symbol
+    visibly present that the deterministic pass missed or double-counted),
+    never to report a width — see attach_openings() and its reconciliation
+    caller for how a vision-only find is kept distinct from a measured one.
+    """
+    labels_line = ", ".join(f'"{l}"' for l in ocr_labels) if ocr_labels else "(none read)"
+    return (
+        "This is an architectural floor plan drawing. Identify every DOOR and WINDOW "
+        "symbol you can see drawn on it. A door is a quarter-circle swing arc plus a "
+        "straight leaf line, set into a wall opening. A window is a short hollow/hatched "
+        "box or a gap with tick marks, set into an exterior (sometimes interior) wall band "
+        "— it never has a swing arc. Count each individually even if several are drawn "
+        "close together (e.g. a row of windows on one wall) or if a door/window style "
+        "repeats identically around the building. "
+        f"Text already read off this drawing by OCR (room names, labels): {labels_line}. "
+        "Use these only as context for where rooms are, not as opening evidence. "
+        "Return JSON only: {\"openings\": [{\"kind\": \"door\" or \"window\", "
+        "\"positionFraction\": [x, y] (this opening's approximate center, as a fraction "
+        "0.0-1.0 of the image width and height), \"confidence\": number 0.0-1.0}]}. "
+        "Do not invent openings that aren't actually drawn; do not count a plain wall "
+        "corner, a furniture edge, or a dimension tick mark as an opening."
+    )
+
+
+def identify_openings_via_mistral(
+    rgb: np.ndarray, api_key: str, ocr_labels: list[str],
+    model: str = MISTRAL_DIMENSION_MODEL, max_tokens: int = 2000,
+) -> list[dict]:
+    """Mistral vision identification of door/window symbols, as a coverage
+    cross-check for the deterministic CV opening detector. Returns a list of
+    {kind, positionFraction, confidence} dicts — positionFraction is
+    resolved to pixel coordinates and the nearest wall by
+    geometric_model.attach_openings(), not here, keeping this a pure vision
+    call with no geometry dependency (same split as
+    identify_subcomponents_via_mistral)."""
+    prompt = opening_prompt(ocr_labels)
+    for attempt in range(2):
+        attempt_prompt = prompt
+        if attempt:
+            attempt_prompt = prompt + (
+                " Your previous reply was cut off or invalid. Return a SHORTER, complete "
+                "JSON object — fewer openings listed if needed, but valid JSON."
+            )
+        try:
+            text = _mistral_request(
+                api_key, model, rgb, attempt_prompt, max_tokens, {"type": "json_object"})
+            parsed = json.loads(text or "{}")
+            items = parsed.get("openings", [])
+            return [
+                item for item in items
+                if isinstance(item, dict) and item.get("kind") in ("door", "window")
+            ]
+        except urllib.error.HTTPError as exc:
+            if attempt == 0:
+                continue
+            _, message = _provider_error_details(exc)
+            suffix = f": {message}" if message else ""
+            raise RuntimeError(f"Mistral request failed ({exc.code}){suffix}") from exc
+        except json.JSONDecodeError:
+            if attempt == 0:
+                continue
+            raise RuntimeError("Mistral request failed: reply was not valid JSON after retry")
+    raise RuntimeError("Mistral request failed after retry")
+
+
 def _bounded_confidence(value) -> float:
     try:
         return max(0.0, min(float(value), 1.0))

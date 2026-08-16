@@ -19,10 +19,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
-from .geometric_model import attach_subcomponents
+from .geometric_model import attach_openings, attach_subcomponents
 from .guidance import (
     QwenTopologyGuide,
     dimension_read_prompt,
+    identify_openings_via_mistral,
     identify_subcomponents_via_mistral,
     read_dimensions_via_mistral,
     specify_via_mistral,
@@ -132,6 +133,19 @@ async def convert_plan(
                     geometric_model, subcomponents,
                     image_size_px=result.model.image_size, mm_per_px=result.mm_per_px,
                 )
+                # Vision cross-check for door/window coverage (see
+                # guidance.opening_prompt / geometric_model.attach_openings):
+                # the deterministic CV detector still owns every real width,
+                # this only flags symbols it may have missed or duplicated.
+                openings = _opening_advisory(
+                    source, page, geometric_model.get("textLabels", []),
+                )
+                attach_openings(
+                    geometric_model, openings,
+                    image_size_px=result.model.image_size, mm_per_px=result.mm_per_px,
+                    deterministic_doors=[d.to_dict() for d in result.model.doors],
+                    deterministic_windows=[w.to_dict() for w in result.model.windows],
+                )
             return {
                 "buildingProfile": profile,
                 "topology": result.model.to_dict(),
@@ -146,8 +160,17 @@ async def convert_plan(
                 },
                 "metrics": {
                     "walls": len(result.model.walls),
+                    # "doors"/"windows" stay the deterministic, pixel-measured
+                    # count — the only one with real widths. The vision cross-
+                    # check (attach_openings) never edits these; the number of
+                    # symbols it saw that AREN'T within match distance of one
+                    # of these is surfaced separately below so a consumer can
+                    # tell "we traced N" from "vision saw more/fewer than N"
+                    # without walking geometricModel.openings itself.
                     "doors": len(result.model.doors),
                     "windows": len(result.model.windows),
+                    "doorsMissedByGeometry": _unconfirmed_count(geometric_model, "door"),
+                    "windowsMissedByGeometry": _unconfirmed_count(geometric_model, "window"),
                     "rooms": len(result.model.rooms),
                     "connections": len(result.model.connections),
                     "objects": len(result.model.objects),
@@ -218,6 +241,32 @@ def _subcomponent_advisory(source: Path, page: int, text_labels: list[dict]) -> 
         prep = preprocess(raster.rgb)
         labels = [t["text"] for t in text_labels if t.get("text")]
         return identify_subcomponents_via_mistral(prep.display_rgb, mistral_key, labels)
+    except Exception:  # noqa: BLE001 - advisory stream must not fail the request
+        return []
+
+
+def _unconfirmed_count(geometric_model: dict, kind: str) -> int:
+    """How many vision-identified openings of this kind (see attach_openings)
+    weren't within match distance of a deterministically-traced one — the
+    signal that the CV pass likely missed a real door/window symbol."""
+    return sum(
+        1 for item in geometric_model.get("openings", [])
+        if item.get("kind") == kind and item.get("confirmedByGeometry") is False
+    )
+
+
+def _opening_advisory(source: Path, page: int, text_labels: list[dict]) -> list[dict]:
+    """Mistral-only door/window coverage cross-check, same degrade pattern
+    as _subcomponent_advisory: any failure or missing key returns an empty
+    list rather than failing the request or fabricating openings."""
+    mistral_key = os.environ.get("MISTRAL_API_KEY")
+    if not mistral_key:
+        return []
+    try:
+        raster = load_raster(source, page=page)
+        prep = preprocess(raster.rgb)
+        labels = [t["text"] for t in text_labels if t.get("text")]
+        return identify_openings_via_mistral(prep.display_rgb, mistral_key, labels)
     except Exception:  # noqa: BLE001 - advisory stream must not fail the request
         return []
 

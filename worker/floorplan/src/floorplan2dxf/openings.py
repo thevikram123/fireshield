@@ -63,10 +63,25 @@ def detect_openings(
     if thin is None or not thin.any():
         return []
 
+    # A wall shorter than a door span cannot host an opening of its own — it
+    # is a partition stub, a closet return, or a short connector between two
+    # real runs. Dropping those here (not from the traced wall list itself,
+    # which real geometry/DXF export still needs in full) keeps
+    # perimeter_lines()'s grouping and _nearest_wall()'s arc-to-wall matching
+    # working with the same kind of "real wall runs only" candidate set this
+    # detection was built and tuned against. On a plan with a lot of small
+    # real partition fragments (a densely-divided building whose exterior
+    # wall itself also fragments into many short runs around each window),
+    # letting all of them compete as separate perimeter/opening candidates
+    # measurably hurt door/window accuracy even though every fragment was
+    # legitimate architecture — this is a red flag for opening detection
+    # specifically, not for whether the ink is real.
+    significant = [wall for wall in walls if _wall_length(wall) >= door_span] or walls
+
     # Windows: hollow runs in exterior wall bands. Doors: swing arcs, which are
     # mostly on interior walls, so the two searches do not compete.
-    windows = _detect_windows(ink, walls, door_span)
-    doors = _detect_doors(thin, walls, door_span, windows)
+    windows = _detect_windows(ink, significant, door_span)
+    doors = _detect_doors(thin, significant, door_span, windows)
     return _dedupe(doors + windows, min_separation=door_span * 0.5)
 
 
@@ -92,6 +107,11 @@ def _wall_axis(wall: Wall) -> tuple[bool, float, float, float]:
 def _wall_thickness(wall: Wall) -> float:
     """Drawn wall thickness in pixels (walls_from_mask stores it in this unit)."""
     return max(2.0, float(getattr(wall, "thickness_mm", 0.0) or 0.0))
+
+
+def _wall_length(wall: Wall) -> float:
+    (x1, y1), (x2, y2) = wall.start, wall.end
+    return math.hypot(x2 - x1, y2 - y1)
 
 
 def _nearest_wall(

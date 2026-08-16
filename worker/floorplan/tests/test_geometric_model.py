@@ -4,7 +4,7 @@ research activity; see worker/floorplan/symbol_lab/README.md for the design
 history and the two real coordinate-space bugs it caught before this ported
 into the real package).
 """
-from floorplan2dxf.geometric_model import attach_subcomponents, build_geometric_model
+from floorplan2dxf.geometric_model import attach_openings, attach_subcomponents, build_geometric_model
 from floorplan2dxf.geometry import CvGeometry
 from floorplan2dxf.schema import TextItem, Wall
 
@@ -106,3 +106,30 @@ def test_attach_subcomponents_resolves_position_fraction_and_adjacent_walls():
     assert "wall_28" in resolved["staircase"]["adjacentWallIds"]
     assert resolved["dining_table"]["adjacentWallIds"] == []
     assert resolved["staircase"]["position"]["px"] == [4.0, 4.0]
+
+
+def test_attach_openings_confirms_a_match_and_flags_a_geometry_miss():
+    """A vision-identified opening near an already-traced one of the same
+    kind is confirmed; one with nothing nearby is flagged as likely missed
+    by the deterministic CV pass — the signal the compliance reasoning step
+    uses to treat opening count as a floor, not a ceiling, without this
+    module ever inventing a width for the unconfirmed one."""
+    model = {
+        "walls": [{"id": "wall_0", "start": {"px": [0.0, 0.0]}, "end": {"px": [200.0, 0.0]}, "thicknessMm": 8.0}],
+    }
+    deterministic_doors = [{"center": [50.0, 2.0]}]
+    deterministic_windows = []
+    mistral_openings = [
+        {"kind": "door", "positionFraction": [0.25, 0.01], "confidence": 0.9},  # near the traced door
+        {"kind": "window", "positionFraction": [0.75, 0.01], "confidence": 0.8},  # no traced window at all
+    ]
+
+    attach_openings(
+        model, mistral_openings, image_size_px=(200, 100), mm_per_px=None,
+        deterministic_doors=deterministic_doors, deterministic_windows=deterministic_windows,
+    )
+
+    by_kind = {o["kind"]: o for o in model["openings"]}
+    assert by_kind["door"]["confirmedByGeometry"] is True
+    assert by_kind["window"]["confirmedByGeometry"] is False
+    assert by_kind["door"]["nearestWallId"] == "wall_0"

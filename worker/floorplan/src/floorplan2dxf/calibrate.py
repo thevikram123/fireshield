@@ -60,6 +60,16 @@ def parse_dimension_pair(text: str) -> Optional[tuple[float, float]]:
     parts = [p.strip() for p in _PAIR_SPLIT.split(cleaned) if p.strip()]
     if len(parts) != 2:
         return None
+    # "3.15x3.0m" — a common shorthand where the unit is written once, on the
+    # second number, and implicitly applies to both. Without this, the first
+    # bare number ("3.15") fails to parse on its own (a bare decimal under
+    # 100 is genuinely ambiguous — could be feet, metres, or a typo) even
+    # though it is unambiguous in context. Only borrow the second part's unit
+    # onto the first if the first has none of its own already.
+    if not re.search(r"[a-zA-Z\"']", parts[0]):
+        unit_match = re.search(r"[a-zA-Z]+$", parts[1])
+        if unit_match:
+            parts[0] = parts[0] + unit_match.group(0)
     a = parse_length_mm(parts[0])
     b = parse_length_mm(parts[1])
     if a is None or b is None or a <= 0 or b <= 0:
@@ -151,7 +161,25 @@ def calibrate_mm_per_px(
     if not candidates:
         return None
     candidates.sort()
-    return float(candidates[len(candidates) // 2])
+    # Room-label matching depends on room segmentation being roughly
+    # accurate, which it is not guaranteed to be — the flood-filled regions
+    # rooms_from_mask() finds can split or merge a real room, so a label can
+    # end up aspect-matched against a bounding box that doesn't actually
+    # belong to it. Confirmed directly on a real plan: candidates from that
+    # kind of mismatch ranged from ~6 to ~33 mm/px (a >5x spread) while the
+    # true scale was a single consistent value; blindly taking the median of
+    # a pool that disagreed that badly produced a number roughly 4x too
+    # small. A wide spread (relative to the pool's own median, not a fixed
+    # mm/px constant) is itself the signal that these matches aren't
+    # trustworthy — better to report "could not infer scale" than a
+    # confident-looking wrong one, matching how this function already
+    # returns None rather than guess when there's no candidate at all.
+    median = float(candidates[len(candidates) // 2])
+    q1 = float(candidates[len(candidates) // 4])
+    q3 = float(candidates[(3 * len(candidates)) // 4])
+    if len(candidates) >= 4 and median > 0 and (q3 - q1) / median > 0.5:
+        return None
+    return median
 
 
 def _median(values: list[float]) -> Optional[float]:
@@ -237,6 +265,20 @@ def calibrate_from_wall_dimensions(
 
 
 def standalone_lengths_mm(texts: Iterable[TextItem]) -> list[float]:
+    """Lengths from labels meant to stand alone as an overall dimension —
+    NOT the two components of an "AxB" pair. A pair like "3.31x5.97m" is a
+    single room's own call-out, not a building-wide measurement; pulling
+    both halves in here (as this used to) mixes numbers from unrelated
+    rooms once a drawing has several such labels, and calibrate_auto() takes
+    the two largest of whatever this returns as if they were one true
+    overall width/height pair. Confirmed directly on a real plan with five
+    per-room "AxB m" labels: the two largest components happened to come
+    from two different rooms (a dining room's length and an unrelated
+    garage's width) and calibrate_auto() silently accepted them as the
+    building's own overall footprint, producing a scale several times too
+    small. Only a genuinely standalone number (nothing else on that text)
+    is safe to treat as a candidate half of a real overall dimension.
+    """
     texts = list(texts)
     metric_drawing = any(
         re.search(r"\b(?:mts?|metres?|meters?)\b|scale\s*1\s*:\s*\d+", text.content, re.I)
@@ -244,9 +286,6 @@ def standalone_lengths_mm(texts: Iterable[TextItem]) -> list[float]:
     )
     lengths: list[float] = []
     for text in texts:
-        if text.parsed_mm:
-            lengths.extend([text.parsed_mm[0], text.parsed_mm[1]])
-            continue
         one = parse_length_mm(text.content)
         if one and one >= 1500:
             lengths.append(one)

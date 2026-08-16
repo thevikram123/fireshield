@@ -61,19 +61,39 @@ def denoise(rgb: np.ndarray) -> np.ndarray:
 
 
 def isolate_wall_strokes(rgb: np.ndarray) -> np.ndarray:
-    """Keep thick architectural ink; drop furniture, text, and colored dimension bars."""
+    """Otsu-binarize and lightly denoise; drop colored dimension bars.
+
+    Used to hard-filter to "thick" ink here via a FIXED distance-transform
+    threshold (dist >= 1.4px), meant to separate wall strokes from thinner
+    furniture/text ink. Root-caused via a real second floor plan (a denser,
+    12-room layout) where several genuine wall segments render at an
+    effective stroke width under that fixed threshold: the filter zeroed out
+    an entire wing of the building (confirmed by comparing this function's
+    raw Otsu-stage output, which had every wall intact, against its final
+    "thick-only" output, which had lost them) while barely affecting a
+    simpler test plan — exactly the kind of per-image assumption that can't
+    generalize across different renderers/line weights/export scales.
+
+    The Otsu binarization alone reliably captures the complete architectural
+    ink on every plan tested (it's what full-image contrast-based
+    thresholding is for); a fixed absolute pixel-thickness gate on top of it
+    is where the loss happens. Downstream steps (keep_building_ink's area/
+    shape filtering, extract_geometry's component-significance filtering,
+    walls_from_mask's own line-length filtering) already separate real
+    architecture from small artifacts using RELATIVE criteria derived from
+    the drawing's own content, not an absolute pixel constant — so this
+    function no longer needs to (and, as shown, can't safely) do that
+    separation by stroke thickness alone. Only light, size-invariant denoise
+    (a 2x2 open to remove true speckle) remains.
+    """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     binary[hsv[:, :, 1] > 70] = 0
-    open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k, iterations=1)
-    dist = cv2.distanceTransform(opened, cv2.DIST_L2, 3)
-    thick = (dist >= 1.4).astype(np.uint8) * 255
-    if cv2.countNonZero(thick) < 80:
-        thick = opened
+    denoise_k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, denoise_k, iterations=1)
     restore = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    return cv2.dilate(thick, restore, iterations=1)
+    return cv2.dilate(opened, restore, iterations=1)
 
 
 def letterbox(rgb: np.ndarray, max_side: int = 1024, multiple: int = 64) -> tuple[np.ndarray, float, tuple[int, int, int, int]]:
