@@ -159,8 +159,8 @@ class QwenTopologyGuide:
         )
         try:
             return _qwen_dimension_lines(self.api_key, self.model, rgb, prompt, max_tokens=900)
-        except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
-            return {}
+        except Exception as exc:  # noqa: BLE001 - scale recovery is best-effort, never fatal
+            return {"_error": str(exc)[:300]}  # TEMP DIAGNOSTIC, see _qwen_dimension_lines
 
     def _capture_review(self, payload: dict, initial: bool) -> None:
         review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
@@ -455,7 +455,14 @@ def _qwen_dimension_lines(api_key: str, model: str, rgb: np.ndarray, prompt: str
         overall_match = _OVERALL_LINE.match(line)
         if overall_match:
             overall_w, overall_h = float(overall_match.group("w")), float(overall_match.group("h"))
-    return {"dimensions": dimensions, "overall_width_m": overall_w, "overall_height_m": overall_h}
+    # TEMP DIAGNOSTIC (remove once scale recovery is confirmed live): the raw
+    # reply, so a failure to parse is distinguishable from Qwen genuinely not
+    # producing the requested format, without needing another live round trip
+    # to find out which.
+    return {
+        "dimensions": dimensions, "overall_width_m": overall_w, "overall_height_m": overall_h,
+        "_raw": text[:600],
+    }
 
 
 def _bounded_confidence(value) -> float:

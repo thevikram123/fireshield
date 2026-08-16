@@ -201,13 +201,17 @@ def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) 
     # every printed dimension number competed for one completion budget and
     # lost — dimensions never arrived, and openings quality regressed too.
     # Its own failure must not affect the spaces/openings read above.
+    dim_debug_raw = None
+    dim_debug_error = None
     try:
         dims = guide.read_dimensions(prep.display_rgb)
         spec["dimensions"] = dims.get("dimensions")
         spec["overall_width_m"] = dims.get("overall_width_m")
         spec["overall_height_m"] = dims.get("overall_height_m")
-    except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
-        pass
+        dim_debug_raw = dims.get("_raw")  # TEMP DIAGNOSTIC
+        dim_debug_error = dims.get("_error")
+    except Exception as exc:  # noqa: BLE001 - scale recovery is best-effort, never fatal
+        dim_debug_error = str(exc)[:300]
     return {
         "status": guide.audit.specification_status,
         "confidence": guide.audit.specification_confidence,
@@ -254,6 +258,11 @@ def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) 
             if isinstance(item, dict)
         ],
         "_overallMm": _overall_mm_from_spec(spec),
+        # TEMP DIAGNOSTIC: not popped by the caller, so it reaches the client
+        # response for one live look at what Qwen actually returned. Remove
+        # once scale recovery is confirmed working.
+        "dimDebugRaw": dim_debug_raw,
+        "dimDebugError": dim_debug_error,
     }
 
 
