@@ -19,7 +19,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
-from .guidance import QwenTopologyGuide
+from .guidance import QwenTopologyGuide, dimension_read_prompt, read_dimensions_via_mistral
 from .ingest import load_raster
 from .pipeline import convert
 from .preprocess import preprocess
@@ -201,18 +201,31 @@ def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) 
     # every printed dimension number competed for one completion budget and
     # lost — dimensions never arrived, and openings quality regressed too.
     # Its own failure must not affect the spaces/openings read above.
-    # Advisory fallback only: Tesseract OCR (see ocr.py, pipeline.py) is the
-    # PRIMARY scale-recovery path now and runs independently of Qwen entirely.
-    # This still helps on drawings OCR can't read (rotated/stylized text),
-    # since pipeline.py only falls back to vision_dimensions when the OCR
-    # path found no scale at all.
-    try:
-        dims = guide.read_dimensions(prep.display_rgb)
-        spec["dimensions"] = dims.get("dimensions")
-        spec["overall_width_m"] = dims.get("overall_width_m")
-        spec["overall_height_m"] = dims.get("overall_height_m")
-    except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
-        pass
+    #
+    # Provider order: Mistral first (a completely separate quota pool from
+    # Groq/Qwen, so it can never collide with whatever the site/photo audit or
+    # plan compliance reasoning is doing against Groq concurrently — which is
+    # exactly what killed this before: two Qwen calls per plan collided with
+    # the shared budget and the second 429'd). Falls back to Qwen only if no
+    # Mistral key is configured or the call fails. Tesseract OCR (ocr.py,
+    # pipeline.py) remains the PRIMARY scale-recovery path regardless — this
+    # is the fallback pipeline.py only reaches when OCR found no scale.
+    dims: dict = {}
+    mistral_key = os.environ.get("MISTRAL_API_KEY")
+    if mistral_key:
+        try:
+            dims = read_dimensions_via_mistral(
+                prep.display_rgb, mistral_key, dimension_read_prompt(prep.display_rgb))
+        except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
+            dims = {}
+    if not dims.get("dimensions") and not (dims.get("overall_width_m") or dims.get("overall_height_m")):
+        try:
+            dims = guide.read_dimensions(prep.display_rgb)
+        except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
+            dims = {}
+    spec["dimensions"] = dims.get("dimensions")
+    spec["overall_width_m"] = dims.get("overall_width_m")
+    spec["overall_height_m"] = dims.get("overall_height_m")
     return {
         "status": guide.audit.specification_status,
         "confidence": guide.audit.specification_confidence,

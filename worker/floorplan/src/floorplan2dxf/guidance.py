@@ -136,28 +136,7 @@ class QwenTopologyGuide:
         crowded one. EasyOCR is disabled at runtime (Render memory limit), so
         this is the only source for printed dimensions.
         """
-        height, width = rgb.shape[:2]
-        # A compact line per dimension, not JSON: no repeated field names to
-        # pay for on every one of a plan's 10-20 labels. Format is exactly
-        # "<value_m> <H|V> <x> <y>", one per line, e.g. "2.00 H 219 162" for a
-        # horizontal 2.00m label centred at pixel (219,162). Blank/unreadable
-        # lines are simply omitted.
-        prompt = (
-            "Read every printed dimension label on this floor-plan drawing. Output ONLY plain text lines "
-            "in this exact format, nothing else — no JSON, no markdown, no explanation:\n"
-            "<value_m> <H|V> <x> <y>\n"
-            "One line per printed number along a dimension line — each individual segment (e.g. \"2.00\", "
-            "\"4.00\", \"3.00\" drawn along one wall run), not only the outermost total. value_m is the "
-            "number converted to metres (convert feet/inches). H means it labels a horizontal (width/length) "
-            "run, V a vertical (height/depth) run. x y is the pixel position of that label, near the wall "
-            "segment it measures. Read as many as are legibly printed; omit any you cannot read confidently "
-            "— never guess a value. "
-            "After all dimension lines, add exactly one final line for the printed OUTER envelope total for "
-            "the whole building (not a single room): \"OVERALL <width_m> <height_m>\". If no explicit overall "
-            "total is printed, write \"OVERALL 0 0\".\n"
-            "Example output:\n2.00 H 219 162\n4.00 H 420 162\n8.00 V 68 550\nOVERALL 9.00 11.00\n"
-            f"image_size=[{width},{height}]."
-        )
+        prompt = dimension_read_prompt(rgb)
         try:
             return _qwen_dimension_lines(self.api_key, self.model, rgb, prompt, max_tokens=900)
         except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
@@ -450,6 +429,34 @@ def _qwen_json(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_token
         raise RuntimeError("Qwen request failed after JSON validation retry")
 
 
+def dimension_read_prompt(rgb: np.ndarray) -> str:
+    """The compact-line dimension-reading prompt, shared by every provider
+    (Qwen, Mistral) so a change to the format only has to be made once.
+    """
+    height, width = rgb.shape[:2]
+    # A compact line per dimension, not JSON: no repeated field names to pay
+    # for on every one of a plan's 10-20 labels. Format is exactly
+    # "<value_m> <H|V> <x> <y>", one per line, e.g. "2.00 H 219 162" for a
+    # horizontal 2.00m label centred at pixel (219,162). Blank/unreadable
+    # lines are simply omitted.
+    return (
+        "Read every printed dimension label on this floor-plan drawing. Output ONLY plain text lines "
+        "in this exact format, nothing else — no JSON, no markdown, no explanation:\n"
+        "<value_m> <H|V> <x> <y>\n"
+        "One line per printed number along a dimension line — each individual segment (e.g. \"2.00\", "
+        "\"4.00\", \"3.00\" drawn along one wall run), not only the outermost total. value_m is the "
+        "number converted to metres (convert feet/inches). H means it labels a horizontal (width/length) "
+        "run, V a vertical (height/depth) run. x y is the pixel position of that label, near the wall "
+        "segment it measures. Read as many as are legibly printed; omit any you cannot read confidently "
+        "— never guess a value. "
+        "After all dimension lines, add exactly one final line for the printed OUTER envelope total for "
+        "the whole building (not a single room): \"OVERALL <width_m> <height_m>\". If no explicit overall "
+        "total is printed, write \"OVERALL 0 0\".\n"
+        "Example output:\n2.00 H 219 162\n4.00 H 420 162\n8.00 V 68 550\nOVERALL 9.00 11.00\n"
+        f"image_size=[{width},{height}]."
+    )
+
+
 #: Matches one compact dimension line: "2.00 H 219 162" (value, orientation
 #: letter, x, y). Whitespace-tolerant; unrecognised lines are simply skipped
 #: rather than failing the whole read, so partial output is never wasted.
@@ -461,20 +468,18 @@ _OVERALL_LINE = re.compile(
 )
 
 
-def _qwen_dimension_lines(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
-    """Read a compact line-based format instead of JSON.
-
-    Repeating JSON's field names ("value_m", "orientation", "position") for
-    every one of a plan's 10-20 printed dimensions is what competed the
-    dimension read out of its token budget in the combined call. A plain line
-    per dimension carries the same information in roughly a fifth the
-    characters, which both fits far more of them in the same completion
-    budget and, since output tokens are what the daily quota bills, costs
-    less per call outright. No JSON-repair retry is needed: unparseable lines
-    are just skipped, so a partially malformed reply still yields whatever it
+def _parse_dimension_lines(text: str) -> dict:
+    """Shared by every provider: turn the compact line format into the same
+    {"dimensions": [...], "overall_width_m": ..., "overall_height_m": ...}
+    shape regardless of which vision model produced the text. Repeating
+    JSON's field names ("value_m", "orientation", "position") for every one
+    of a plan's 10-20 printed dimensions is what competed the dimension read
+    out of its token budget when this was folded into the combined call — a
+    plain line per dimension carries the same information in roughly a fifth
+    the characters. No JSON-repair retry is needed: unparseable lines are
+    simply skipped, so a partially malformed reply still yields whatever it
     got right instead of being discarded entirely.
     """
-    text = _qwen_request(api_key, model, rgb, prompt, max_tokens, response_format=None)
     dimensions: list[dict] = []
     overall_w = overall_h = 0.0
     for line in text.splitlines():
@@ -490,6 +495,78 @@ def _qwen_dimension_lines(api_key: str, model: str, rgb: np.ndarray, prompt: str
         if overall_match:
             overall_w, overall_h = float(overall_match.group("w")), float(overall_match.group("h"))
     return {"dimensions": dimensions, "overall_width_m": overall_w, "overall_height_m": overall_h}
+
+
+def _qwen_dimension_lines(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
+    text = _qwen_request(api_key, model, rgb, prompt, max_tokens, response_format=None)
+    return _parse_dimension_lines(text)
+
+
+#: Separate provider, separate quota pool from Groq/Qwen entirely — which is
+#: the actual point: firing this from a fresh budget means it can never
+#: collide with whatever the site/photo audit or plan compliance reasoning is
+#: doing against Groq at the same time.
+#: "mistral-medium-3-5-26-04" (the dated ID) does not appear in the account's
+#: own rate-limit dashboard (admin.mistral.ai/plateforme/limits) at all, so it
+#: is not confirmed as a real, callable model ID — using it risked a request
+#: that fails outright. "mistral-medium-latest" IS listed there (25,000
+#: TPM / 0.83 RPS) and is Mistral's alias for the current newest Medium
+#: release, so it is used instead: same model family, a confirmed-valid ID.
+MISTRAL_DIMENSION_MODEL = os.environ.get("MISTRAL_VISION_MODEL", "mistral-medium-latest")
+_MISTRAL_MAX_RATE_LIMIT_WAIT_SECONDS = 12.0
+
+
+def read_dimensions_via_mistral(
+    rgb: np.ndarray, api_key: str, prompt: str, max_tokens: int = 900,
+    model: str = MISTRAL_DIMENSION_MODEL,
+) -> dict:
+    """Same compact-line dimension read as Qwen's, sent to Mistral instead.
+
+    Mistral's chat completions endpoint is OpenAI-shaped EXCEPT for how an
+    image is attached: their own docs example uses "image_url" as a flat
+    string ("image_url": "https://...") rather than OpenAI/Groq's nested
+    {"image_url": {"url": ...}}. Their base64 example wasn't shown, but the
+    flat-string convention is the one thing confirmed, so a base64 data URI
+    is sent the same way — as that same flat string, just with a data: URI.
+    """
+    rgb = _downscale_for_vision(rgb)
+    ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not ok:
+        raise RuntimeError("could not encode plan image")
+    image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": image_url},
+        ]}],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    for attempt in range(2):
+        req = urllib.request.Request(
+            "https://api.mistral.ai/v1/chat/completions", data=payload, headers=headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                result = json.load(response)
+            text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return _parse_dimension_lines(text)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt == 0:
+                wait = _retry_after_seconds(exc)
+                if wait is not None and 0 < wait <= _MISTRAL_MAX_RATE_LIMIT_WAIT_SECONDS:
+                    time.sleep(wait)
+                    continue
+            _, message = _provider_error_details(exc)
+            suffix = f": {message}" if message else ""
+            raise RuntimeError(f"Mistral request failed ({exc.code}){suffix}") from exc
+    raise RuntimeError("Mistral request failed after rate-limit retry")
 
 
 def _bounded_confidence(value) -> float:
