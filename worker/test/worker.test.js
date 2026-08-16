@@ -47,6 +47,60 @@ test('health reports model, index, secret, and limiter bindings', async () => {
   assert.equal(body.floorplanConfigured, true);
 });
 
+const TEST_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+test('groqVision uses Mistral as the primary backbone, with a flat image_url string (not nested)', async (t) => {
+  let mistralPayload = null;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url).includes('api.mistral.ai')) {
+      mistralPayload = JSON.parse(options.body);
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        detections: [{ type: 'extinguisher', count: 1, condition: 'good', label: 'wall-mounted', confidence: 0.9 }],
+      }) } }] });
+    }
+    throw new Error('Groq should not be called when Mistral succeeds');
+  });
+
+  const response = await worker.fetch(
+    post('/groq/vision', { images: [TEST_PNG], evidenceContext: {} }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.detections[0].type, 'extinguisher');
+  assert.equal(mistralPayload.model, 'mistral-medium-latest');
+  const imagePart = mistralPayload.messages[1].content.find((c) => c.type === 'image_url');
+  assert.equal(typeof imagePart.image_url, 'string', 'Mistral takes a flat image_url string, not {url: ...}');
+  assert.equal(imagePart.image_url, TEST_PNG);
+});
+
+test('groqVision falls back to Groq/Qwen when Mistral fails or is not configured', async (t) => {
+  const seenUrls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    seenUrls.push(String(url));
+    if (String(url).includes('api.mistral.ai')) {
+      return new Response(JSON.stringify({ error: { message: 'down' } }), { status: 500, headers: {} });
+    }
+    const payload = JSON.parse(options.body);
+    const imagePart = payload.messages[1].content.find((c) => c.type === 'image_url');
+    assert.deepEqual(imagePart.image_url, { url: TEST_PNG }, 'Groq takes the nested {url: ...} shape');
+    return Response.json({ choices: [{ message: { content: JSON.stringify({
+      detections: [{ type: 'sprinkler', count: 2, condition: 'good', label: '', confidence: 0.8 }],
+    }) } }] });
+  });
+
+  const response = await worker.fetch(
+    post('/groq/vision', { images: [TEST_PNG], evidenceContext: {} }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.detections[0].type, 'sprinkler');
+  assert.ok(seenUrls.some((u) => u.includes('api.groq.com')));
+});
+
 test('the model picker switches to whichever pool actually has headroom', (t) => {
   const { pickAvailableModel, groqQuota } = __testing__;
   const HEAVY = 'openai/gpt-oss-120b';

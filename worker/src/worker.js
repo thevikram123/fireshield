@@ -807,44 +807,74 @@ async function groqVision(request, env, cors, apiKey) {
   const instruction = `${String(body.prompt || DEFAULT_VISION_PROMPT).slice(0, 4000)}\n`
     + `Evidence capture context: ${JSON.stringify(evidenceContext)}. `
     + 'Use this only to locate the scene; do not treat the auditor notes as proof of equipment or condition.';
-  const content = [
+
+  // Mistral (confirmed via their vision docs) takes a FLAT base64/URL string
+  // for image_url, not Groq/OpenAI's nested {url: "..."}, so each provider
+  // needs its own content array built from the same images.
+  const groqContent = [
     { type: 'text', text: instruction },
     ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
   ];
+  const mistralContent = [
+    { type: 'text', text: instruction },
+    ...images.map((url) => ({ type: 'image_url', image_url: url })),
+  ];
 
-  const visionPayload = {
-    model: env.GROQ_VISION_MODEL,
-    messages: [
-      { role: 'system', content: VISION_SYSTEM },
-      { role: 'user', content },
-    ],
-    temperature: 0.2,
-    max_completion_tokens: 1200,
-    // Qwen 3.6 defaults toward its thinking mode, which can consume the entire
-    // completion budget on hidden reasoning tokens for a complex/alarming scene
-    // and return empty content (json_validate_failed with no failed_generation).
-    // Force non-thinking mode so tokens go to the JSON response itself.
-    reasoning_effort: 'none',
-    response_format: { type: 'json_object' },
+  const retryInstruction = {
+    role: 'user',
+    content: 'Your previous reply failed JSON validation. Return exactly one '
+      + 'valid JSON object of the requested shape, with no markdown, comments '
+      + 'or trailing text.',
   };
-  let data = await callGroq(apiKey, visionPayload);
-  // Groq JSON Object Mode can emit invalid JSON (json_validate_failed). The docs
-  // prescribe a validate-and-retry; do exactly one reinforced retry.
-  if (data.error && data.code === 'json_validate_failed') {
-    data = await callGroq(apiKey, {
-      ...visionPayload,
-      messages: [
-        { role: 'system', content: VISION_SYSTEM },
-        { role: 'user', content },
-        {
-          role: 'user',
-          content: 'Your previous reply failed JSON validation. Return exactly one '
-            + 'valid JSON object of the requested shape, with no markdown, comments '
-            + 'or trailing text.',
-        },
-      ],
-    });
+
+  const mistralKey = env.MISTRAL_API_KEY ? await readSecret(env.MISTRAL_API_KEY) : '';
+  let data = null;
+  if (mistralKey) {
+    const mistralPayload = {
+      model: 'mistral-medium-latest',
+      messages: [{ role: 'system', content: VISION_SYSTEM }, { role: 'user', content: mistralContent }],
+      temperature: 0.2,
+      max_completion_tokens: 1200,
+      response_format: { type: 'json_object' },
+    };
+    data = await callMistral(mistralKey, mistralPayload);
+    if (data.error) {
+      data = await callMistral(mistralKey, {
+        ...mistralPayload,
+        messages: [...mistralPayload.messages, retryInstruction],
+      });
+    }
   }
+
+  // Groq/Qwen as a fallback (not primary — Groq's vision pool is the one that
+  // hits its DAILY token cap under real use, and a fallback can't help until
+  // that resets many hours later, but it's still useful if Mistral itself is
+  // briefly down some other day).
+  if (!data || data.error) {
+    const groqPayload = {
+      model: env.GROQ_VISION_MODEL,
+      messages: [{ role: 'system', content: VISION_SYSTEM }, { role: 'user', content: groqContent }],
+      temperature: 0.2,
+      max_completion_tokens: 1200,
+      // Qwen 3.6 defaults toward its thinking mode, which can consume the
+      // entire completion budget on hidden reasoning tokens for a complex/
+      // alarming scene and return empty content (json_validate_failed with no
+      // failed_generation). Force non-thinking mode so tokens go to the JSON
+      // response itself.
+      reasoning_effort: 'none',
+      response_format: { type: 'json_object' },
+    };
+    data = await callGroq(apiKey, groqPayload);
+    // Groq JSON Object Mode can emit invalid JSON (json_validate_failed). The
+    // docs prescribe a validate-and-retry; do exactly one reinforced retry.
+    if (data.error && data.code === 'json_validate_failed') {
+      data = await callGroq(apiKey, {
+        ...groqPayload,
+        messages: [...groqPayload.messages, retryInstruction],
+      });
+    }
+  }
+
   if (data.error) {
     return json({ error: data.error, retryAfterSeconds: data.retryAfterSeconds ?? null },
       data.status, { ...cors, ...data.headers });
