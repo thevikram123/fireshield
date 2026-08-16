@@ -479,3 +479,142 @@ test('disallowed origins are rejected before consuming a limiter unit', async ()
   assert.equal(response.status, 403);
   assert.equal(calls, 0);
 });
+
+test('groqReason uses Mistral as primary when MISTRAL_API_KEY is configured and succeeds', async (t) => {
+  const seenUrls = [];
+  const seenPayloads = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    seenUrls.push(String(url));
+    const payload = JSON.parse(options.body);
+    seenPayloads.push(payload);
+
+    if (String(url).includes('api.mistral.ai')) {
+      return Response.json({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              occupancySummary: 'Business occupancy (Mistral)',
+              score: 95,
+              findings: [],
+              citedClauses: []
+            })
+          }
+        }]
+      });
+    }
+
+    if (String(url).includes('api.groq.com')) {
+      return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+    }
+    return Response.json({});
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
+    env({
+      MISTRAL_API_KEY: 'test-mistral-key',
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.occupancySummary, 'Business occupancy (Mistral)');
+  assert.equal(body.score, 95);
+
+  const mistralIndex = seenUrls.findIndex(u => u.includes('api.mistral.ai'));
+  assert.ok(mistralIndex >= 0, 'Mistral should be called');
+  const mistralPayload = seenPayloads[mistralIndex];
+  assert.equal(mistralPayload.model, 'mistral-medium-latest');
+  assert.deepEqual(mistralPayload.response_format, { type: 'json_object' });
+});
+
+test('groqReason falls back to Groq when MISTRAL_API_KEY is configured but Mistral fails', async (t) => {
+  const seenUrls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    seenUrls.push(String(url));
+
+    if (String(url).includes('api.mistral.ai')) {
+      return new Response(JSON.stringify({ error: { message: 'Mistral internal error' } }), {
+        status: 500,
+        headers: {},
+      });
+    }
+
+    if (String(url).includes('api.groq.com')) {
+      const payload = JSON.parse(options.body);
+      if (payload.tool_choice === 'none') {
+        return Response.json({
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                occupancySummary: 'Business occupancy (Groq fallback)',
+                score: 85,
+                findings: [],
+                citedClauses: []
+              })
+            }
+          }]
+        });
+      }
+      return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+    }
+    return Response.json({});
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
+    env({
+      MISTRAL_API_KEY: 'test-mistral-key',
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.occupancySummary, 'Business occupancy (Groq fallback)');
+  assert.equal(body.score, 85);
+
+  assert.ok(seenUrls.includes('https://api.mistral.ai/v1/chat/completions'), 'Mistral should have been tried');
+  const groqCalls = seenUrls.filter(u => u.includes('api.groq.com'));
+  assert.equal(groqCalls.length, 2, 'Should call Groq twice (1 tool hop + 1 fallback verdict)');
+});
+
+test('groqReason goes straight to Groq when MISTRAL_API_KEY is not configured', async (t) => {
+  const seenUrls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    seenUrls.push(String(url));
+
+    if (String(url).includes('api.groq.com')) {
+      const payload = JSON.parse(options.body);
+      if (payload.tool_choice === 'none') {
+        return Response.json({
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                occupancySummary: 'Business occupancy (Groq straight)',
+                score: 80,
+                findings: [],
+                citedClauses: []
+              })
+            }
+          }]
+        });
+      }
+      return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+    }
+    return Response.json({});
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
+    env(),
+  );
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.occupancySummary, 'Business occupancy (Groq straight)');
+  assert.equal(body.score, 80);
+
+  assert.ok(!seenUrls.includes('https://api.mistral.ai/v1/chat/completions'), 'Mistral should not be called');
+  const groqCalls = seenUrls.filter(u => u.includes('api.groq.com'));
+  assert.equal(groqCalls.length, 2, 'Should call Groq twice');
+});

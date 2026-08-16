@@ -42,6 +42,11 @@ const PLAN_MAX_TOOL_HOPS = 1;
 // session just did, and the 429s showed ~7900 already consumed before a plan
 // assessment even started.
 const GROQ_TPM_BUDGET = 5200;
+// mistral-medium-latest's confirmed account limit is 25,000 TPM (the smallest
+// Mistral tier used here) vs Groq's 8,000 TPM/min cap that GROQ_TPM_BUDGET is
+// sized against. Reusing Groq's tight budget for the Mistral request would
+// trim context (fewer NBC lookup results) that Mistral has real headroom for.
+const MISTRAL_TPM_BUDGET = 20_000;
 // The verdict must fit a complete JSON object (summary, findings, citations,
 // limitations). Squeezing this to 1100 truncated the generation mid-object and
 // failed schema validation, so it is sized to finish the response while input
@@ -899,32 +904,46 @@ async function groqReason(request, env, cors, apiKey) {
     }
   }
 
-  // Force a final structured verdict grounded in the tool results. This is
-  // the step that actually needs 120b's reasoning strength, so it's the
-  // preferred model — but if 120b's pool is the one currently tight and 20b
-  // has room, switch automatically rather than fail a request 20b could
-  // still answer (degraded, but real, beats a hard 429 mid-demo).
-  const finalModel = pickAvailableModel(
-    env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, REASON_FINAL_MAX_TOKENS);
+  // Force a final structured verdict grounded in the tool results.
+  // Using Mistral as the primary model to avoid Groq's 429 TPM limits,
+  // falling back to Groq if Mistral is not configured or fails.
   const { base: reasonBase, summary: reasonFindings } = summariseToolLoop(messages);
-  const finalData = await callGroq(apiKey, {
-    model: finalModel,
-    messages: fitMessagesToTokenBudget(
-      [
-        ...reasonBase,
-        {
-          role: 'user',
-          content: (reasonFindings ? `NBCS lookup results:\n${reasonFindings}\n\n` : '') + FINAL_INSTRUCTION,
-        },
-      ],
-      GROQ_TPM_BUDGET - REASON_FINAL_MAX_TOKENS,
-    ),
-    tool_choice: 'none',
-    temperature: 0.2,
-    max_completion_tokens: REASON_FINAL_MAX_TOKENS,
-    include_reasoning: false,
-    response_format: { type: 'json_object' },
-  });
+  const rawFinalMessages = [
+    ...reasonBase,
+    {
+      role: 'user',
+      content: (reasonFindings ? `NBCS lookup results:\n${reasonFindings}\n\n` : '') + FINAL_INSTRUCTION,
+    },
+  ];
+
+  const mistralKey = env.MISTRAL_API_KEY ? await readSecret(env.MISTRAL_API_KEY) : '';
+  let finalData = null;
+  if (mistralKey) {
+    finalData = await callMistral(mistralKey, {
+      model: 'mistral-medium-latest',
+      messages: fitMessagesToTokenBudget(rawFinalMessages, MISTRAL_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
+      tool_choice: 'none',
+      temperature: 0.2,
+      max_completion_tokens: REASON_FINAL_MAX_TOKENS,
+      include_reasoning: false,
+      response_format: { type: 'json_object' },
+    });
+  }
+
+  if (!finalData || finalData.error) {
+    const finalModel = pickAvailableModel(
+      env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, REASON_FINAL_MAX_TOKENS);
+    finalData = await callGroq(apiKey, {
+      model: finalModel,
+      messages: fitMessagesToTokenBudget(rawFinalMessages, GROQ_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
+      tool_choice: 'none',
+      temperature: 0.2,
+      max_completion_tokens: REASON_FINAL_MAX_TOKENS,
+      include_reasoning: false,
+      response_format: { type: 'json_object' },
+    });
+  }
+
   if (finalData.error) {
     return json({ error: finalData.error, retryAfterSeconds: finalData.retryAfterSeconds ?? null },
       finalData.status, { ...cors, ...finalData.headers });
@@ -1073,6 +1092,48 @@ async function callGroq(apiKey, payload, { retriedAfterRateLimit = false } = {})
   // x-ratelimit-remaining-tokens / -reset-tokens — instead of a fixed guess.
   const successHeaders = groqRateLimitHeaders(upstream.headers);
   recordGroqQuota(payload.model, successHeaders);
+  return { json: body, headers: successHeaders };
+}
+
+async function callMistral(apiKey, payload, { retriedAfterRateLimit = false } = {}) {
+  const mistralPayload = { ...payload };
+  if (mistralPayload.max_completion_tokens !== undefined) {
+    mistralPayload.max_tokens = mistralPayload.max_completion_tokens;
+    delete mistralPayload.max_completion_tokens;
+  }
+  delete mistralPayload.include_reasoning;
+
+  const upstream = await fetch('https://api.mistral.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ stream: false, ...mistralPayload }),
+  });
+  let body;
+  try { body = await upstream.json(); } catch { body = null; }
+  if (!upstream.ok) {
+    const detail = body?.error && typeof body.error === 'object' ? body.error : {};
+    const code = String(detail.code || detail.type || '').slice(0, 100);
+    const message = String(detail.message || '').slice(0, 500);
+
+    if (upstream.status === 429 && !retriedAfterRateLimit) {
+      const waitMs = Math.round(parseFloat(upstream.headers.get('retry-after') || '0') * 1000);
+      if (waitMs > 0 && waitMs <= MAX_RATE_LIMIT_WAIT_MS) {
+        await sleep(waitMs);
+        return callMistral(apiKey, payload, { retriedAfterRateLimit: true });
+      }
+    }
+    console.error(JSON.stringify({ message: 'Mistral call failed', status: upstream.status, model: payload.model, code }));
+    const providerDetail = [code, message].filter(Boolean).join(': ');
+    const errorHeaders = groqRateLimitHeaders(upstream.headers);
+    return {
+      error: `Mistral call failed (${upstream.status})${providerDetail ? `: ${providerDetail}` : ''}`,
+      status: upstream.status,
+      code,
+      retryAfterSeconds: parseFloat(upstream.headers.get('retry-after') || '0') || null,
+      headers: errorHeaders,
+    };
+  }
+  const successHeaders = groqRateLimitHeaders(upstream.headers);
   return { json: body, headers: successHeaders };
 }
 
@@ -1327,5 +1388,5 @@ function json(value, status, headers = {}) {
 // through the full HTTP+mock-fetch machinery (and without leaking state into
 // unrelated tests in the same process).
 export const __testing__ = {
-  pickAvailableModel, groqQuota, fitMessagesToTokenBudget, estimateTokens, summariseToolLoop,
+  pickAvailableModel, groqQuota, fitMessagesToTokenBudget, estimateTokens, summariseToolLoop, callMistral,
 };
