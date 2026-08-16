@@ -19,7 +19,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
-from .guidance import QwenTopologyGuide, dimension_read_prompt, read_dimensions_via_mistral
+from .guidance import (
+    QwenTopologyGuide,
+    dimension_read_prompt,
+    read_dimensions_via_mistral,
+    specify_via_mistral,
+)
 from .ingest import load_raster
 from .pipeline import convert
 from .preprocess import preprocess
@@ -180,38 +185,73 @@ def _cached_qwen_advisory(
 
 
 def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) -> dict:
-    """Separate Qwen visual stream. Advisory only — it never constrains the DXF.
+    """Vision advisory stream. Advisory only — it never constrains the DXF.
 
     Returns the model's semantic read of the plan (spaces, openings, visible
     safety features) so GPT-OSS can reason over it *alongside* the deterministic
     geometry. Any failure degrades to an explicit status, never to a fake result.
+
+    Provider order for both the main read and dimensions: Mistral first — a
+    completely separate quota pool from Groq/Qwen, so it can never collide
+    with whatever the site/photo audit or plan compliance reasoning is doing
+    against Groq at the same moment (which is exactly what broke this before:
+    two Qwen calls per plan collided with the shared budget and the second
+    429'd). Falls back to Qwen only if no MISTRAL_API_KEY is configured or the
+    call fails — the Qwen guide is therefore built lazily, only if a fallback
+    is actually needed, since building it requires GROQ_API_KEY to be
+    configured and that must not gate the Mistral-only path.
     """
-    try:
-        guide = QwenTopologyGuide(api_key=api_key, building_profile=profile)
-    except RuntimeError as exc:
-        return {"status": "unavailable", "detail": str(exc)[:300]}
     try:
         raster = load_raster(source, page=page)
         prep = preprocess(raster.rgb)
-        spec = guide.specify(prep.display_rgb)
     except Exception as exc:  # noqa: BLE001 - advisory stream must not fail the request
         return {"status": "unavailable", "detail": str(exc)[:300]}
+
+    qwen_guide: QwenTopologyGuide | None = None
+    qwen_error: str | None = None
+
+    def qwen_fallback() -> QwenTopologyGuide | None:
+        nonlocal qwen_guide, qwen_error
+        if qwen_guide is None and qwen_error is None:
+            try:
+                qwen_guide = QwenTopologyGuide(api_key=api_key, building_profile=profile)
+            except RuntimeError as exc:
+                qwen_error = str(exc)[:300]
+        return qwen_guide
+
+    mistral_key = os.environ.get("MISTRAL_API_KEY")
+    spec: dict = {}
+    status, confidence, summary = "unavailable", 0.0, ""
+    if mistral_key:
+        try:
+            spec = specify_via_mistral(prep.display_rgb, mistral_key, profile)
+            status = str(spec.get("status", "insufficient"))
+            status = status if status in {"usable", "insufficient"} else "insufficient"
+            confidence = max(0.0, min(float(spec.get("confidence", 0) or 0), 1.0))
+            summary = str(spec.get("summary", ""))[:500]
+        except Exception:  # noqa: BLE001 - fall through to the Qwen path below
+            spec = {}
+    if not spec:
+        guide = qwen_fallback()
+        if guide is None:
+            return {"status": "unavailable", "detail": qwen_error or "no vision provider configured"}
+        try:
+            spec = guide.specify(prep.display_rgb)
+            status = guide.audit.specification_status
+            confidence = guide.audit.specification_confidence
+            summary = guide.audit.specification_summary
+        except Exception as exc:  # noqa: BLE001 - advisory stream must not fail the request
+            return {"status": "unavailable", "detail": str(exc)[:300]}
+
     # Second, small, dedicated call: printed dimensions only. Kept separate
     # from specify() because asking one call for spaces/openings/elements AND
     # every printed dimension number competed for one completion budget and
     # lost — dimensions never arrived, and openings quality regressed too.
-    # Its own failure must not affect the spaces/openings read above.
-    #
-    # Provider order: Mistral first (a completely separate quota pool from
-    # Groq/Qwen, so it can never collide with whatever the site/photo audit or
-    # plan compliance reasoning is doing against Groq concurrently — which is
-    # exactly what killed this before: two Qwen calls per plan collided with
-    # the shared budget and the second 429'd). Falls back to Qwen only if no
-    # Mistral key is configured or the call fails. Tesseract OCR (ocr.py,
-    # pipeline.py) remains the PRIMARY scale-recovery path regardless — this
-    # is the fallback pipeline.py only reaches when OCR found no scale.
+    # Its own failure must not affect the spaces/openings read above. Tesseract
+    # OCR (ocr.py, pipeline.py) remains the PRIMARY scale-recovery path
+    # regardless — this is the fallback pipeline.py reaches when OCR found no
+    # scale at all.
     dims: dict = {}
-    mistral_key = os.environ.get("MISTRAL_API_KEY")
     if mistral_key:
         try:
             dims = read_dimensions_via_mistral(
@@ -219,17 +259,19 @@ def _qwen_advisory(source: Path, page: int, api_key: str | None, profile: dict) 
         except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
             dims = {}
     if not dims.get("dimensions") and not (dims.get("overall_width_m") or dims.get("overall_height_m")):
-        try:
-            dims = guide.read_dimensions(prep.display_rgb)
-        except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
-            dims = {}
+        guide = qwen_fallback()
+        if guide is not None:
+            try:
+                dims = guide.read_dimensions(prep.display_rgb)
+            except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
+                dims = {}
     spec["dimensions"] = dims.get("dimensions")
     spec["overall_width_m"] = dims.get("overall_width_m")
     spec["overall_height_m"] = dims.get("overall_height_m")
     return {
-        "status": guide.audit.specification_status,
-        "confidence": guide.audit.specification_confidence,
-        "summary": guide.audit.specification_summary,
+        "status": status,
+        "confidence": confidence,
+        "summary": summary,
         "spaces": [
             {
                 "label": str(item.get("label", ""))[:80],

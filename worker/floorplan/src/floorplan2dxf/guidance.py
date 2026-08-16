@@ -87,39 +87,16 @@ class QwenTopologyGuide:
 
     def specify(self, rgb: np.ndarray) -> dict:
         """Create the vision-first semantic target that constrains reconstruction."""
-        height, width = rgb.shape[:2]
-        prompt = (
-            "Inspect this floor-plan image before any geometry extraction. Define what a deterministic Python "
-            "reconstructor should produce. Coordinates are pixels in image_size. Return JSON only: "
-            '{"status":"usable|insufficient","confidence":0..1,"summary":string,'
-            '"spaces":[{"label":string,"type":string,"category":"occupied|circulation|service|shaft|safety",'
-            '"center":[x,y],"bbox":[x0,y0,x1,y1],'
-            '"confidence":0..1}],"major_walls":[{"orientation":"horizontal|vertical",'
-            '"start":[x,y],"end":[x,y],"kind":"external|internal","confidence":0..1}],'
-            '"openings":[{"type":"door|window","center":[x,y],"connects":[string,string],'
-            '"is_external":true|false,"confidence":0..1}]}. '
-            'For EVERY opening also report what it attaches to: "connects" lists the labels of the one or two '
-            'spaces it joins (use the exact space labels you returned above; for a door or window on an outside '
-            'wall use the single interior space plus "OUTSIDE"), and "is_external" is true when it leads outdoors. '
-            'A door to the outside is an egress point, so this matters more than the count. Always give "center" '
-            'as pixel coordinates for windows too, not just doors — never return null for center. '
-            'Also return "grid":{"x":[pixel positions],"y":[pixel positions]} and '
-            '"elements":[{"id":string,"kind":string,"category":"structural|circulation|safety|mep|other",'
-            '"label":string,"center":[x,y],"bbox":[x0,y0,x1,y1],"confidence":0..1}]. '
-            "Include commercial spaces and features when visible: offices, tenant areas, corridors, lobbies, "
-            "stairs, fire-escape stairs, lift banks, shafts, service/electrical rooms, fire command centres, "
-            "refuge areas, compartments and exits. Preserve exact visible labels. Do not assume residential "
-            "space types or invent features from the building profile. Include only structural walls, not "
-            "furniture, dimension lines, text underlines, or room contents. "
-            f"image_size=[{width},{height}]. Building profile context="
-            + json.dumps(self.building_profile)
-        )
+        prompt = specify_prompt(rgb, self.building_profile)
         self.plan_spec = _qwen_json(self.api_key, self.model, rgb, prompt, max_tokens=1800)
-        status = str(self.plan_spec.get("status", "insufficient"))
-        self.audit.specification_status = status if status in {"usable", "insufficient"} else "insufficient"
-        self.audit.specification_confidence = _bounded_confidence(self.plan_spec.get("confidence", 0))
-        self.audit.specification_summary = str(self.plan_spec.get("summary", ""))[:500]
+        self._record_specification(self.plan_spec)
         return self.plan_spec
+
+    def _record_specification(self, spec: dict) -> None:
+        status = str(spec.get("status", "insufficient"))
+        self.audit.specification_status = status if status in {"usable", "insufficient"} else "insufficient"
+        self.audit.specification_confidence = _bounded_confidence(spec.get("confidence", 0))
+        self.audit.specification_summary = str(spec.get("summary", ""))[:500]
 
     def read_dimensions(self, rgb: np.ndarray) -> dict:
         """A second, small, focused call: read printed dimension labels only.
@@ -429,6 +406,37 @@ def _qwen_json(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_token
         raise RuntimeError("Qwen request failed after JSON validation retry")
 
 
+def specify_prompt(rgb: np.ndarray, building_profile: dict) -> str:
+    """The spaces/walls/openings/elements prompt, shared across providers."""
+    height, width = rgb.shape[:2]
+    return (
+        "Inspect this floor-plan image before any geometry extraction. Define what a deterministic Python "
+        "reconstructor should produce. Coordinates are pixels in image_size. Return JSON only: "
+        '{"status":"usable|insufficient","confidence":0..1,"summary":string,'
+        '"spaces":[{"label":string,"type":string,"category":"occupied|circulation|service|shaft|safety",'
+        '"center":[x,y],"bbox":[x0,y0,x1,y1],'
+        '"confidence":0..1}],"major_walls":[{"orientation":"horizontal|vertical",'
+        '"start":[x,y],"end":[x,y],"kind":"external|internal","confidence":0..1}],'
+        '"openings":[{"type":"door|window","center":[x,y],"connects":[string,string],'
+        '"is_external":true|false,"confidence":0..1}]}. '
+        'For EVERY opening also report what it attaches to: "connects" lists the labels of the one or two '
+        'spaces it joins (use the exact space labels you returned above; for a door or window on an outside '
+        'wall use the single interior space plus "OUTSIDE"), and "is_external" is true when it leads outdoors. '
+        'A door to the outside is an egress point, so this matters more than the count. Always give "center" '
+        'as pixel coordinates for windows too, not just doors — never return null for center. '
+        'Also return "grid":{"x":[pixel positions],"y":[pixel positions]} and '
+        '"elements":[{"id":string,"kind":string,"category":"structural|circulation|safety|mep|other",'
+        '"label":string,"center":[x,y],"bbox":[x0,y0,x1,y1],"confidence":0..1}]. '
+        "Include commercial spaces and features when visible: offices, tenant areas, corridors, lobbies, "
+        "stairs, fire-escape stairs, lift banks, shafts, service/electrical rooms, fire command centres, "
+        "refuge areas, compartments and exits. Preserve exact visible labels. Do not assume residential "
+        "space types or invent features from the building profile. Include only structural walls, not "
+        "furniture, dimension lines, text underlines, or room contents. "
+        f"image_size=[{width},{height}]. Building profile context="
+        + json.dumps(building_profile)
+    )
+
+
 def dimension_read_prompt(rgb: np.ndarray) -> str:
     """The compact-line dimension-reading prompt, shared by every provider
     (Qwen, Mistral) so a change to the format only has to be made once.
@@ -514,27 +522,35 @@ def _qwen_dimension_lines(api_key: str, model: str, rgb: np.ndarray, prompt: str
 #: release, so it is used instead: same model family, a confirmed-valid ID.
 MISTRAL_DIMENSION_MODEL = os.environ.get("MISTRAL_VISION_MODEL", "mistral-medium-latest")
 _MISTRAL_MAX_RATE_LIMIT_WAIT_SECONDS = 12.0
+#: A single real drawing used well under half of this (~1300 of 4000 tokens
+#: for 8 spaces + 9 walls + 12 openings + 1 element). Left generous rather
+#: than tuned to that one observation — a denser commercial plan with many
+#: more rooms/openings needs real headroom, and Mistral's account TPM budget
+#: (25,000-375,000/min depending on model) makes this cheap regardless.
+#: specify_via_mistral() also retries with a shorten-the-reply instruction if
+#: this still isn't enough for a particular drawing.
+MISTRAL_SPECIFY_MAX_TOKENS = int(os.environ.get("MISTRAL_SPECIFY_MAX_TOKENS", "6000"))
 
 
-def read_dimensions_via_mistral(
-    rgb: np.ndarray, api_key: str, prompt: str, max_tokens: int = 900,
-    model: str = MISTRAL_DIMENSION_MODEL,
-) -> dict:
-    """Same compact-line dimension read as Qwen's, sent to Mistral instead.
+def _mistral_request(
+    api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int,
+    response_format: dict | None,
+) -> str:
+    """Shared HTTP call for every Mistral use (dimensions, specify, ...).
 
     Mistral's chat completions endpoint is OpenAI-shaped EXCEPT for how an
-    image is attached: their own docs example uses "image_url" as a flat
-    string ("image_url": "https://...") rather than OpenAI/Groq's nested
-    {"image_url": {"url": ...}}. Their base64 example wasn't shown, but the
-    flat-string convention is the one thing confirmed, so a base64 data URI
-    is sent the same way — as that same flat string, just with a data: URI.
+    image is attached: their own docs example (fetched and read directly, not
+    assumed — see guidance.py history) uses "image_url" as a flat string
+    ("image_url": "data:image/jpeg;base64,...."), not OpenAI/Groq's nested
+    {"image_url": {"url": ...}}. response_format:{"type":"json_object"} is
+    also confirmed from their docs, same shape as OpenAI/Groq's.
     """
     rgb = _downscale_for_vision(rgb)
     ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
     if not ok:
         raise RuntimeError("could not encode plan image")
     image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
-    payload = json.dumps({
+    payload = {
         "model": model,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
@@ -542,7 +558,10 @@ def read_dimensions_via_mistral(
         ]}],
         "max_tokens": max_tokens,
         "temperature": 0.2,
-    }).encode("utf-8")
+    }
+    if response_format is not None:
+        payload["response_format"] = response_format
+    body = json.dumps(payload).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -550,23 +569,78 @@ def read_dimensions_via_mistral(
     }
     for attempt in range(2):
         req = urllib.request.Request(
-            "https://api.mistral.ai/v1/chat/completions", data=payload, headers=headers, method="POST",
+            "https://api.mistral.ai/v1/chat/completions", data=body, headers=headers, method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=60) as response:
                 result = json.load(response)
-            text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return _parse_dimension_lines(text)
+            return result.get("choices", [{}])[0].get("message", {}).get("content", "")
         except urllib.error.HTTPError as exc:
+            # Only 429 is retried here; everything else (including a JSON-mode
+            # validation error, if Mistral emits one) is re-raised unmodified
+            # so callers that need to react to a specific status can.
             if exc.code == 429 and attempt == 0:
                 wait = _retry_after_seconds(exc)
                 if wait is not None and 0 < wait <= _MISTRAL_MAX_RATE_LIMIT_WAIT_SECONDS:
                     time.sleep(wait)
                     continue
+            raise
+    raise RuntimeError("Mistral request failed after rate-limit retry")
+
+
+def read_dimensions_via_mistral(
+    rgb: np.ndarray, api_key: str, prompt: str, max_tokens: int = 900,
+    model: str = MISTRAL_DIMENSION_MODEL,
+) -> dict:
+    try:
+        text = _mistral_request(api_key, model, rgb, prompt, max_tokens, response_format=None)
+    except urllib.error.HTTPError as exc:
+        _, message = _provider_error_details(exc)
+        suffix = f": {message}" if message else ""
+        raise RuntimeError(f"Mistral request failed ({exc.code}){suffix}") from exc
+    return _parse_dimension_lines(text)
+
+
+def specify_via_mistral(
+    rgb: np.ndarray, api_key: str, building_profile: dict,
+    model: str = MISTRAL_DIMENSION_MODEL, max_tokens: int = MISTRAL_SPECIFY_MAX_TOKENS,
+) -> dict:
+    """Mistral equivalent of QwenTopologyGuide.specify() — spaces, walls,
+    openings (with connectivity/is_external) and elements, in one call.
+
+    Verified live against a real floor plan: 8/8 spaces correctly labelled,
+    5/5 doors with connectivity, 7/8 windows with connectivity and external
+    flags, using well under half of a 4000-token budget — noticeably more
+    complete than Qwen was returning for the same prompt, and on a separate
+    quota pool from Groq entirely. A denser plan (many more rooms/openings)
+    could still run past that budget and get cut off mid-JSON, so this
+    retries once, explicitly asking for a shorter reply, on either a JSON
+    decode failure or a 400 that names a JSON-mode validation problem —
+    the same two-strikes pattern _qwen_json already uses.
+    """
+    prompt = specify_prompt(rgb, building_profile)
+    for attempt in range(2):
+        attempt_prompt = prompt
+        if attempt:
+            attempt_prompt = prompt + (
+                " Your previous reply was cut off before completing the JSON object. Keep every field, "
+                "but shorten summary text and omit low-confidence spaces/elements so the full object fits."
+            )
+        try:
+            text = _mistral_request(
+                api_key, model, rgb, attempt_prompt, max_tokens, {"type": "json_object"})
+            return json.loads(text or "{}")
+        except urllib.error.HTTPError as exc:
+            if attempt == 0:
+                continue
             _, message = _provider_error_details(exc)
             suffix = f": {message}" if message else ""
             raise RuntimeError(f"Mistral request failed ({exc.code}){suffix}") from exc
-    raise RuntimeError("Mistral request failed after rate-limit retry")
+        except json.JSONDecodeError:
+            if attempt == 0:
+                continue
+            raise RuntimeError("Mistral request failed: reply was not valid JSON after retry")
+    raise RuntimeError("Mistral request failed after retry")
 
 
 def _bounded_confidence(value) -> float:

@@ -12,7 +12,7 @@ import urllib.request
 
 import numpy as np
 
-from floorplan2dxf.guidance import read_dimensions_via_mistral
+from floorplan2dxf.guidance import read_dimensions_via_mistral, specify_via_mistral
 
 
 def _fake_response(payload: dict):
@@ -107,3 +107,59 @@ def test_a_non_429_error_is_not_retried(monkeypatch):
     except RuntimeError:
         pass
     assert calls["n"] == 1
+
+
+def test_specify_enforces_json_mode_and_returns_parsed_object(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _fake_response({"choices": [{"message": {"content": json.dumps({
+            "status": "usable", "confidence": 0.95, "summary": "s",
+            "spaces": [{"label": "KITCHEN"}], "openings": [], "elements": [],
+        })}}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    result = specify_via_mistral(np.zeros((10, 10, 3), dtype=np.uint8), "test-key", {})
+
+    assert captured["body"]["response_format"] == {"type": "json_object"}
+    assert result["status"] == "usable"
+    assert result["spaces"][0]["label"] == "KITCHEN"
+
+
+def test_specify_retries_a_truncated_reply_asking_for_a_shorter_one(monkeypatch):
+    # A denser plan (many more rooms/openings than the reference drawing)
+    # could run past the completion budget and get cut off mid-JSON.
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _fake_response({"choices": [{"message": {
+                "content": '{"status":"usable","spaces":[{"label":"A"',  # truncated, invalid JSON
+            }}]})
+        body = json.loads(req.data)
+        # The retry must actually ask for something different, not repeat
+        # the identical prompt and get cut off the same way again.
+        text_prompt = body["messages"][0]["content"][0]["text"]
+        assert "cut off" in text_prompt.lower()
+        return _fake_response({"choices": [{"message": {"content": json.dumps({
+            "status": "usable", "spaces": [{"label": "A"}], "openings": [], "elements": [],
+        })}}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    result = specify_via_mistral(np.zeros((10, 10, 3), dtype=np.uint8), "test-key", {})
+    assert calls["n"] == 2
+    assert result["spaces"][0]["label"] == "A"
+
+
+def test_specify_raises_after_two_truncated_replies(monkeypatch):
+    def fake_urlopen(req, timeout=None):
+        return _fake_response({"choices": [{"message": {"content": "{not valid json"}}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    try:
+        specify_via_mistral(np.zeros((10, 10, 3), dtype=np.uint8), "test-key", {})
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
