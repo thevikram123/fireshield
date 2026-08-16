@@ -618,3 +618,37 @@ test('groqReason goes straight to Groq when MISTRAL_API_KEY is not configured', 
   const groqCalls = seenUrls.filter(u => u.includes('api.groq.com'));
   assert.equal(groqCalls.length, 2, 'Should call Groq twice');
 });
+
+test('a 429 on the tool-selection hop degrades to the final verdict instead of failing the request', async (t) => {
+  // This is the actual bug behind the live failure: the hop loop still runs
+  // on Groq alone (out of scope for the Mistral-fallback change above) and
+  // used to return the hop's own error immediately — before the final verdict
+  // call, the one that's actually resilient now, ever got a chance to run.
+  // A tight hop must degrade (proceed with whatever tool results already
+  // exist, possibly none) rather than fail the whole audit outright.
+  let mistralCalled = false;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url).includes('api.mistral.ai')) {
+      mistralCalled = true;
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Answered despite the hop failing', score: 60,
+        findings: [], citedClauses: [],
+      }) } }] });
+    }
+    // The hop call itself 429s — no Retry-After, so callGroq's own retry
+    // doesn't apply either; this must still not reach the client as an error.
+    return new Response(JSON.stringify({
+      error: { code: 'rate_limit_exceeded', message: 'Rate limit reached for openai/gpt-oss-20b' },
+    }), { status: 429, headers: {} });
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.ok(mistralCalled, 'the final verdict call must still run after the hop degrades');
+  const body = await response.json();
+  assert.equal(body.occupancySummary, 'Answered despite the hop failing');
+});

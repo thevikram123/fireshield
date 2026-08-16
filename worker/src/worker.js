@@ -874,12 +874,19 @@ async function groqReason(request, env, cors, apiKey) {
       include_reasoning: false,
     });
     if (data.error) {
-      return json({ error: data.error, retryAfterSeconds: data.retryAfterSeconds ?? null },
-        data.status, { ...cors, ...data.headers });
+      // This hop only decides which NBC clause to look up next — Groq being
+      // tight here must not fail the whole audit (that's exactly what was
+      // still happening live even after the final call gained a Mistral
+      // fallback: this hop returned early on its own 429, before the final
+      // call — the one actually resilient now — ever ran). Degrade instead:
+      // stop gathering further tool results and proceed to the final verdict
+      // with whatever was found so far (possibly nothing), same as when the
+      // model simply returns no more tool_calls.
+      break;
     }
 
     const msg = data.json?.choices?.[0]?.message;
-    if (!msg) return json({ error: 'empty model response' }, 502, cors);
+    if (!msg) break; // same degrade-not-fail reasoning as the error case above
     // Never echo hidden reasoning back to the client.
     messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
 
