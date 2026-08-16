@@ -226,6 +226,11 @@ class FsGroqService {
     required List<DetectedEquipment> detected,
     List<String> docs = const [],
     Map<String, dynamic> evidenceContext = const {},
+    // Each entry: {label, level, floorAreaSqm?, coverage, detected: [...]}.
+    // Lets the reasoning model grade spacing/coverage-sensitive systems
+    // (extinguishers, sprinklers) per captured area instead of only against
+    // a single flattened count that can hide a gap in an unphotographed zone.
+    List<Map<String, dynamic>> zones = const [],
   }) async {
     final res = await _post(
       '/groq/reason',
@@ -234,6 +239,7 @@ class FsGroqService {
         'detected': detected.map((d) => d.toJson()).toList(),
         'docs': docs,
         'evidenceContext': evidenceContext,
+        if (zones.isNotEmpty) 'zones': zones,
       },
       // Shares the org's gpt-oss-120b TPM budget with floor-plan compliance
       // (fs_plan_service.dart) — same rate key so a wait learned from one

@@ -580,9 +580,10 @@ function fitReasonContext(context, maxChars = 10_000) {
   serialized = JSON.stringify(context);
   if (serialized.length <= maxChars) return serialized;
 
-  // Then reduce breadth: fewer guided types, fewer documents.
+  // Then reduce breadth: fewer guided types, fewer documents, fewer zones.
   context.observedEquipmentGuidance = context.observedEquipmentGuidance.slice(0, 4);
   context.documents = (context.documents || []).slice(0, 10);
+  if (Array.isArray(context.zones)) context.zones = context.zones.slice(0, 8);
   serialized = JSON.stringify(context);
   if (serialized.length <= maxChars) return serialized;
 
@@ -593,6 +594,7 @@ function fitReasonContext(context, maxChars = 10_000) {
     results: (group.results || []).slice(0, 1),
   }));
   context.documents = (context.documents || []).slice(0, 5);
+  if (Array.isArray(context.zones)) context.zones = context.zones.slice(0, 5);
   return JSON.stringify(context);
 }
 
@@ -853,7 +855,20 @@ async function groqReason(request, env, cors, apiKey) {
   const detected = Array.isArray(body.detected) ? body.detected.slice(0, 40) : [];
   const docs = Array.isArray(body.docs) ? body.docs.slice(0, 30) : [];
   const evidenceContext = sanitiseEvidenceContext(body.evidenceContext);
-  const observedTypes = [...new Set(detected.map((item) => String(item?.type || '')))]
+  // Multi-zone evidence: the app now lets an auditor capture several separate
+  // areas (e.g. "Ground Floor Lobby", "Ward B") before generating one report.
+  // `detected` above stays the flattened/merged view (back-compat + coarse
+  // system-presence checks); `zones` keeps each area's own counts distinct so
+  // a system present in one zone doesn't silently cover a gap in another.
+  const zones = Array.isArray(body.zones) ? body.zones.slice(0, 12).map((z) => ({
+    label: String(z?.label || z?.zone || 'Unnamed zone').slice(0, 120),
+    level: String(z?.level || '').slice(0, 80),
+    floorAreaSqm: Number.isFinite(Number(z?.floorAreaSqm)) ? Number(z.floorAreaSqm) : undefined,
+    coverage: String(z?.coverage || '').slice(0, 40),
+    detected: Array.isArray(z?.detected) ? z.detected.slice(0, 40) : [],
+  })) : [];
+  const allDetected = zones.length ? [...detected, ...zones.flatMap((z) => z.detected)] : detected;
+  const observedTypes = [...new Set(allDetected.map((item) => String(item?.type || '')))]
     .filter((type) => VISUAL_GUIDANCE_QUERIES[type])
     .slice(0, 8);
   // Table 7/7C protection-level rows are occupancy+height-keyed in their own
@@ -884,6 +899,7 @@ async function groqReason(request, env, cors, apiKey) {
       buildingProfile: profile,
       evidenceContext,
       detectedEquipment: detected,
+      zones: zones.length ? zones : undefined,
       observedEquipmentGuidance: observedGuidance,
       documents: docs,
     }) },
@@ -1273,7 +1289,15 @@ const REASON_SYSTEM =
   + '(e.g. "Table 7 sprinkler requirement for Group C Hospital, height 22m, 4500 sqm"), not just '
   + 'the system name, or you will only find generic definitions instead of the row that applies '
   + 'to this building. Cite the clause id and page from '
-  + 'the tool results. Call query_nbc once per system before concluding.';
+  + 'the tool results. Call query_nbc once per system before concluding. '
+  + 'If the evidence is broken into a `zones` array (each with its own label/level/floorAreaSqm '
+  + 'and detected equipment, from separate areas of the same building), evaluate spacing- and '
+  + 'coverage-sensitive systems (extinguishers, sprinklers, detectors, exit signage) PER ZONE — '
+  + 'equipment present in one zone does NOT satisfy a requirement in a different zone. Where a '
+  + 'finding is zone-specific, name the zone in the "system" field, e.g. '
+  + '"Fire Extinguisher — East Wing Corridor". Zones not yet photographed are simply absent from '
+  + 'the `zones` array; do not assume the whole building is covered unless evidenceContext or the '
+  + 'zone coverage says so.';
 
 const FINAL_INSTRUCTION =
   // Observed live, twice: gpt-oss attempted a tool call on this final turn

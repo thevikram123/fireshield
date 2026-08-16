@@ -771,6 +771,48 @@ test('computeComplianceScore is deterministic for identical findings regardless 
   assert.ok(Math.abs(first.score - 28.33) < 0.01);
 });
 
+test('groqReason folds a zones array into the reasoning context and instructs per-zone grading', async (t) => {
+  let userContent = '';
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const payload = JSON.parse(options.body);
+    if (String(url).includes('api.mistral.ai')) {
+      const userMsg = payload.messages.find((m) => m.role === 'user');
+      userContent = String(userMsg?.content || '');
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Two-zone hospital audit',
+        score: 0,
+        findings: [{
+          system: 'Fire Extinguisher — Ward B', status: 'critical_gap', severity: 'critical',
+          observed: '0 in Ward B', required: 'per Table 7C', clauseId: '', page: null,
+          rationale: 'Ward B has zero extinguishers even though the Lobby zone has two.',
+        }],
+        citedClauses: [],
+      }) } }] });
+    }
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', {
+      buildingProfile: { occupancy: 'Group C - Hospital', heightM: 22 },
+      detected: [],
+      zones: [
+        { label: 'Ground Floor Lobby', level: 'Ground', floorAreaSqm: 300,
+          detected: [{ type: 'extinguisher', count: 2, condition: 'good' }] },
+        { label: 'Ward B', level: 'Level 2', floorAreaSqm: 500, detected: [] },
+      ],
+      docs: [],
+    }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.ok(userContent.includes('Ground Floor Lobby'), 'zone label must reach the model context');
+  assert.ok(userContent.includes('Ward B'));
+  const body = await response.json();
+  assert.equal(body.findings[0].system, 'Fire Extinguisher — Ward B');
+});
+
 test('isValidVerdict rejects empty findings and unknown status/severity enums', () => {
   assert.equal(__testing__.isValidVerdict({ findings: [] }), false);
   assert.equal(__testing__.isValidVerdict({ findings: [{ status: 'compliant', severity: 'minor' }] }), true);

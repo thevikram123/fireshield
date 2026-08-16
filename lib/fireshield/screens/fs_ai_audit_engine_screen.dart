@@ -65,6 +65,59 @@ const _kSystemEvidence = {
   'Evacuation Information': ['evacuation_map'],
 };
 
+/// One captured area's evidence batch. The auditor can capture several of
+/// these (e.g. "Ground Floor Lobby", then "Ward B") before generating a
+/// single compliance report, or generate immediately after just one.
+class _ZoneEvidence {
+  final Map<String, dynamic> context;
+  final List<DetectedEquipment> detected;
+  final List<String> dataUrls;
+  const _ZoneEvidence({
+    required this.context,
+    required this.detected,
+    required this.dataUrls,
+  });
+
+  String get label {
+    final level = context['level'] as String? ?? '';
+    final zone = context['zone'] as String? ?? '';
+    return [level, zone].where((s) => s.isNotEmpty).join(' · ');
+  }
+
+  Map<String, dynamic> toReasonZone() => {
+        'label': label.isEmpty ? 'Unnamed zone' : label,
+        'level': context['level'] as String? ?? '',
+        'coverage': context['coverage'] as String? ?? '',
+        'detected': detected.map((d) => d.toJson()).toList(),
+      };
+}
+
+/// Merge detected equipment across every captured zone into one flat list —
+/// same per-type max-count/best-evidence merge Phase 4 already does within a
+/// single batch, applied across batches for the Gap Analysis / persistence
+/// summary views that only need a whole-building view.
+List<DetectedEquipment> _mergeZoneDetections(List<_ZoneEvidence> zones) {
+  final merged = <String, DetectedEquipment>{};
+  for (final zone in zones) {
+    for (final d in zone.detected) {
+      final prev = merged[d.type];
+      merged[d.type] = prev == null
+          ? d
+          : DetectedEquipment(
+              type: d.type,
+              count: prev.count > d.count ? prev.count : d.count,
+              source: prev.source == d.source ? d.source : 'merged',
+              condition: d.condition.isNotEmpty ? d.condition : prev.condition,
+              label: d.label.isNotEmpty ? d.label : prev.label,
+              confidence: prev.confidence > d.confidence
+                  ? prev.confidence
+                  : d.confidence,
+            );
+    }
+  }
+  return merged.values.toList();
+}
+
 class FsAiAuditEngineScreen extends StatefulWidget {
   const FsAiAuditEngineScreen({super.key});
 
@@ -80,13 +133,23 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
   int _phase = 0;
   BuildingType? _building;
   Map<String, dynamic> _profile = const {};
-  List<DetectedEquipment> _detected = const [];
-  Map<String, dynamic> _evidenceContext = const {};
-  List<String> _evidenceDataUrls = const [];
+  List<_ZoneEvidence> _zones = [];
+  Key _photoAiKey = UniqueKey();
   FsAuditRun? _run;
   String? _storageStatus;
   String? _storageError;
   bool _saving = false;
+
+  List<DetectedEquipment> get _detected => _mergeZoneDetections(_zones);
+  Map<String, dynamic> get _evidenceContext => _zones.isEmpty
+      ? const {}
+      : {
+          ..._zones.last.context,
+          'zoneCount': _zones.length,
+          'zoneLabels': _zones.map((z) => z.label).toList(),
+        };
+  List<String> get _evidenceDataUrls =>
+      _zones.expand((z) => z.dataUrls).toList();
 
   @override
   void initState() {
@@ -146,7 +209,8 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
         organisationId: organisationId,
         kind: 'site',
         title: '${_building?.label ?? 'Site assessment'} · '
-            '${_evidenceContext['level'] ?? ''} · ${_evidenceContext['zone'] ?? ''}',
+            '${_zones.length} zone${_zones.length == 1 ? '' : 's'}'
+            '${_zones.isNotEmpty ? ' (${_zones.map((z) => z.label).where((s) => s.isNotEmpty).join(', ')})' : ''}',
         buildingProfile: {..._profile, 'evidenceContext': _evidenceContext},
       );
       final artifactIds = <String>[];
@@ -226,16 +290,31 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
                   onNext: () => setState(() => _phase = 3),
                 ),
               3 => _Phase4PhotoAi(
+                  key: _photoAiKey,
                   svc: _svc,
                   clip: _clip,
+                  priorZones: _zones,
                   onNext: (result) => setState(() {
-                    _detected = result.detected;
-                    _evidenceContext = result.context;
-                    _evidenceDataUrls = result.dataUrls;
-                    _phase = 4;
+                    _zones = [
+                      ..._zones,
+                      _ZoneEvidence(
+                        context: result.context,
+                        detected: result.detected,
+                        dataUrls: result.dataUrls,
+                      ),
+                    ];
+                    if (result.addAnother) {
+                      // New key forces a fresh _Phase4PhotoAi state so the
+                      // next zone starts with empty photos/fields instead of
+                      // inheriting the just-finished zone's capture.
+                      _photoAiKey = UniqueKey();
+                    } else {
+                      _phase = 4;
+                    }
                   }),
                 ),
               4 => _Phase5GapAnalysis(
+                  zones: _zones,
                   detected: _detected,
                   evidenceContext: _evidenceContext,
                   onNext: () => setState(() => _phase = 5),
@@ -246,6 +325,7 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
                   building: _building,
                   detected: _detected,
                   evidenceContext: _evidenceContext,
+                  zones: _zones,
                   onNext: _acceptSiteRun,
                 ),
               6 => _Phase7Compliance(
@@ -259,9 +339,8 @@ class _FsAiAuditEngineScreenState extends State<FsAiAuditEngineScreen> {
                   onRestart: () => setState(() {
                     _phase = 0;
                     _building = FsAppState.instance.classifiedBuilding;
-                    _detected = const [];
-                    _evidenceContext = const {};
-                    _evidenceDataUrls = const [];
+                    _zones = [];
+                    _photoAiKey = UniqueKey();
                     _run = null;
                     _storageStatus = null;
                     _storageError = null;
@@ -700,16 +779,21 @@ class _PhotoAiResult {
   final List<DetectedEquipment> detected;
   final Map<String, dynamic> context;
   final List<String> dataUrls;
-  const _PhotoAiResult(this.detected, this.context, this.dataUrls);
+  final bool addAnother;
+  const _PhotoAiResult(this.detected, this.context, this.dataUrls,
+      {this.addAnother = false});
 }
 
 class _Phase4PhotoAi extends StatefulWidget {
   final FsGroqService svc;
   final FsClipsegService clip;
+  final List<_ZoneEvidence> priorZones;
   final ValueChanged<_PhotoAiResult> onNext;
   const _Phase4PhotoAi({
+    super.key,
     required this.svc,
     required this.clip,
+    this.priorZones = const [],
     required this.onNext,
   });
 
@@ -869,6 +953,34 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
                 'condition.',
                 style: FsText.small,
               ),
+              if (widget.priorZones.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                FsCard(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'ZONES CAPTURED SO FAR (${widget.priorZones.length})',
+                        style: FsText.xs.copyWith(
+                            fontWeight: FontWeight.w700, letterSpacing: 0.8),
+                      ),
+                      const SizedBox(height: 6),
+                      for (final z in widget.priorZones)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Text(
+                            '• ${z.label.isEmpty ? 'Unnamed zone' : z.label} — '
+                            '${z.detected.length} equipment type'
+                            '${z.detected.length == 1 ? '' : 's'} detected',
+                            style: FsText.tiny,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
               const SizedBox(height: 12),
               TextField(
                 controller: _level,
@@ -1043,11 +1155,51 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
         if (!hasResult)
           _nextBar(context, canAnalyse, _analyse, label: 'Run detection')
         else
-          _nextBar(
-              context,
-              true,
-              () => widget.onNext(_PhotoAiResult(
-                  _detected, _context, List.unmodifiable(_dataUrls)))),
+          Container(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            decoration: const BoxDecoration(
+              color: FsColors.surface,
+              border: Border(top: BorderSide(color: FsColors.border)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => widget.onNext(_PhotoAiResult(
+                        _detected, _context, List.unmodifiable(_dataUrls),
+                        addAnother: true)),
+                    child: const Text('+ Add Another Zone'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: SizedBox(
+                    height: 46,
+                    child: ElevatedButton(
+                      onPressed: () => widget.onNext(_PhotoAiResult(
+                          _detected, _context, List.unmodifiable(_dataUrls),
+                          addAnother: false)),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: FsColors.primary,
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(FsRadius.xl),
+                        ),
+                      ),
+                      child: Text(
+                        widget.priorZones.isEmpty
+                            ? 'Finish & Continue'
+                            : 'Finish (${widget.priorZones.length + 1} zones)',
+                        style: const TextStyle(fontWeight: FontWeight.w800),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
       ],
     );
   }
@@ -1088,10 +1240,12 @@ class _Phase4PhotoAiState extends State<_Phase4PhotoAi> {
 // ─── Phase 5 — Gap Analysis (expected systems vs observed) ─────────────────
 
 class _Phase5GapAnalysis extends StatelessWidget {
+  final List<_ZoneEvidence> zones;
   final List<DetectedEquipment> detected;
   final Map<String, dynamic> evidenceContext;
   final VoidCallback onNext;
   const _Phase5GapAnalysis({
+    required this.zones,
     required this.detected,
     required this.evidenceContext,
     required this.onNext,
@@ -1109,13 +1263,18 @@ class _Phase5GapAnalysis extends StatelessWidget {
               Text(
                 'Observed evidence mapped to the fire-safety systems the '
                 'reasoning model will assess against NBCS 2026. A system with '
-                'no evidence is flagged for the model to verify as a gap.',
+                'no evidence is flagged for the model to verify as a gap. '
+                'Extinguishers/sprinklers/detectors are graded per zone, so '
+                'coverage in one area does not mask a gap in another.',
                 style: FsText.small,
               ),
               const SizedBox(height: 8),
               Text(
-                '${evidenceContext['level'] ?? ''} · ${evidenceContext['zone'] ?? ''} · '
-                '${evidenceContext['coverage'] == 'complete_area' ? 'complete zone coverage' : 'spot check'}',
+                zones.length <= 1
+                    ? '${evidenceContext['level'] ?? ''} · ${evidenceContext['zone'] ?? ''} · '
+                        '${evidenceContext['coverage'] == 'complete_area' ? 'complete zone coverage' : 'spot check'}'
+                    : '${zones.length} zones captured: '
+                        '${zones.map((z) => z.label.isEmpty ? 'Unnamed' : z.label).join(', ')}',
                 style: FsText.tiny,
               ),
               const SizedBox(height: 12),
@@ -1177,6 +1336,7 @@ class _Phase6Findings extends StatefulWidget {
   final BuildingType? building;
   final List<DetectedEquipment> detected;
   final Map<String, dynamic> evidenceContext;
+  final List<_ZoneEvidence> zones;
   final ValueChanged<_SiteRunResult> onNext;
   const _Phase6Findings({
     required this.svc,
@@ -1184,6 +1344,7 @@ class _Phase6Findings extends StatefulWidget {
     required this.building,
     required this.detected,
     required this.evidenceContext,
+    required this.zones,
     required this.onNext,
   });
 
@@ -1209,6 +1370,9 @@ class _Phase6FindingsState extends State<_Phase6Findings> {
         buildingProfile: widget.profile,
         detected: widget.detected,
         evidenceContext: widget.evidenceContext,
+        zones: widget.zones.length > 1
+            ? widget.zones.map((z) => z.toReasonZone()).toList()
+            : const [],
       );
       setState(() {
         _run = run;
