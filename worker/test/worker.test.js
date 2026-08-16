@@ -417,6 +417,58 @@ test('plan compliance uses Mistral as primary for both the hop loop and final ve
   assert.deepEqual(mistralFinalPayload.response_format, { type: 'json_object' });
 });
 
+test('plan compliance retries a truncated (200 OK, no http error) Mistral reply instead of failing outright', async (t) => {
+  // Live-observed bug: Mistral answered 200 with genuinely good, well-
+  // reasoned content that got cut off mid-string by the completion token
+  // budget — no HTTP error at all, so the old retry logic (which only fired
+  // on finalData.error) never triggered, and the whole assessment surfaced
+  // as a generic "invalid plan assessment" with no server-side log of why.
+  let mistralFinalCalls = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url) === 'https://floorplan.test/convert') {
+      return Response.json({
+        buildingProfile: { occupancy: 'Business' },
+        topology: {
+          units: 'mm', mm_per_px: 10,
+          walls: [{ id: 'w0', start: [0, 0], end: [100, 0] }],
+          rooms: [], room_graph: { nodes: [], edges: [] },
+        },
+        metrics: { walls: 1, rooms: 0 }, artifacts: {},
+      });
+    }
+    if (String(url).includes('api.groq.com')) {
+      throw new Error('Groq must not be called while Mistral can still recover');
+    }
+    const payload = JSON.parse(options.body);
+    if (payload.tool_choice === 'none') {
+      mistralFinalCalls++;
+      if (mistralFinalCalls === 1) {
+        // Truncated mid-string — valid HTTP 200, invalid JSON.
+        return Response.json({ choices: [{ message: { content: '{"planSummary": "Cut off here, "score' } }] });
+      }
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        planSummary: 'Complete on retry.', score: 70,
+        findings: [{
+          check: 'Exit count', status: 'compliant', severity: 'minor',
+          observed: 'Two exits identified', required: 'Per NBCS', measurementEvidence: '',
+          clauseId: '', page: null, rationale: 'Meets minimum.',
+        }],
+        citedClauses: [], limitations: [],
+      }) } }] });
+    }
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+  });
+  const form = new FormData();
+  form.append('file', new Blob(['plan'], { type: 'image/png' }), 'plan.png');
+  const response = await worker.fetch(new Request('https://worker.test/plan/convert', {
+    method: 'POST', headers: { Origin: origin }, body: form,
+  }), env({ MISTRAL_API_KEY: 'test-mistral-key' }));
+  assert.equal(response.status, 200);
+  assert.equal(mistralFinalCalls, 2, 'the truncated reply must trigger exactly one corrective retry');
+  const body = await response.json();
+  assert.equal(body.compliance.planSummary, 'Complete on retry.');
+});
+
 test('plan compliance can query_nbc for a specific measured condition before concluding', async (t) => {
   const groqCalls = [];
   t.mock.method(globalThis, 'fetch', async (url, options) => {

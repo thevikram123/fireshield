@@ -50,8 +50,17 @@ const MISTRAL_TPM_BUDGET = 20_000;
 // The verdict must fit a complete JSON object (summary, findings, citations,
 // limitations). Squeezing this to 1100 truncated the generation mid-object and
 // failed schema validation, so it is sized to finish the response while input
-// plus output still stays under the 8000/min cap.
+// plus output still stays under the 8000/min cap. This is the GROQ-fallback
+// budget specifically — Groq's pool is genuinely this tight.
 const PLAN_FINAL_MAX_TOKENS = 1600;
+// The Mistral-primary path's budget (25,000 TPM — see MISTRAL_TPM_BUDGET),
+// separate from Groq's tight one above. Live-observed truncation: adding
+// geometricModel (wallIntersections/dimensions/subcomponents, including a
+// correctly-reasoned staircase/egress finding) gave the model enough extra
+// to discuss that it ran past 1600 tokens and got cut off mid-string,
+// producing invalid JSON with NO http error — the exact same truncation
+// class REASON_FINAL_MAX_TOKENS was raised to fix earlier.
+const PLAN_FINAL_MAX_TOKENS_MISTRAL = 4000;
 const REASON_HOP_MAX_TOKENS = 700;
 // groqReason's final verdict is Mistral-only now (25,000 TPM budget — see
 // MISTRAL_TPM_BUDGET), not the Groq-shared value this used to inherit. 1600
@@ -396,6 +405,14 @@ async function assessFloorplan(converted, env, apiKey) {
     },
   ];
 
+  const planShapeRetryMessage = (label) => ({
+    role: 'user',
+    content: `Your previous reply failed ${label} validation, most likely because it was cut off. `
+      + 'Return exactly one COMPLETE, valid JSON object with every required field present. Keep it '
+      + 'compact: at most six findings and short rationales. Use null (not a missing field) for '
+      + 'clauseId or page when a finding has no clause to cite.',
+  });
+
   // Mistral doesn't get strict json_schema mode here (only json_object was
   // confirmed against Mistral's docs this session) — PLAN_REASON_SYSTEM
   // already restates the exact JSON shape in prose (same technique
@@ -403,39 +420,44 @@ async function assessFloorplan(converted, env, apiKey) {
   // get a matching shape without gambling on an unconfirmed strict-schema
   // field layout. Groq fallback keeps the strict schema it's confirmed to
   // support.
+  //
+  // Retries on EITHER failure mode, mirroring groqReason's attempt(): (a) an
+  // HTTP-level error, or (b) a 200 response whose content doesn't parse into
+  // {findings: [...]} — critically including plain truncation, which is a
+  // successful HTTP call with no .error at all. That second case used to
+  // fall straight through to the generic "invalid plan assessment" error
+  // with zero retry and no server-side log of what actually came back.
   let finalData = null;
+  let planValue = null;
   if (mistralKey) {
     finalData = await callMistral(mistralKey, {
       model: 'mistral-medium-latest',
-      messages: fitMessagesToTokenBudget(rawFinalMessages, MISTRAL_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS),
+      messages: fitMessagesToTokenBudget(rawFinalMessages, MISTRAL_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS_MISTRAL),
       tool_choice: 'none',
       temperature: 0.2,
-      max_completion_tokens: PLAN_FINAL_MAX_TOKENS,
+      max_completion_tokens: PLAN_FINAL_MAX_TOKENS_MISTRAL,
       include_reasoning: false,
       response_format: { type: 'json_object' },
     });
-    if (finalData.error) {
+    planValue = finalData.error ? null : safeJson(finalData.json?.choices?.[0]?.message?.content);
+    if (!finalData.error && (!planValue || !Array.isArray(planValue.findings))) {
       finalData = await callMistral(mistralKey, {
         model: 'mistral-medium-latest',
         messages: fitMessagesToTokenBudget(
-          [...rawFinalMessages, {
-            role: 'user',
-            content: 'Your previous reply failed JSON validation, most likely because it was cut '
-              + 'off. Return exactly one COMPLETE, valid JSON object with every required field '
-              + 'present. Keep it compact: at most six findings and short rationales.',
-          }],
-          MISTRAL_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS - 400,
+          [...rawFinalMessages, planShapeRetryMessage('JSON')],
+          MISTRAL_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS_MISTRAL - 400,
         ),
         tool_choice: 'none',
         temperature: 0.2,
-        max_completion_tokens: PLAN_FINAL_MAX_TOKENS + 400,
+        max_completion_tokens: PLAN_FINAL_MAX_TOKENS_MISTRAL + 400,
         include_reasoning: false,
         response_format: { type: 'json_object' },
       });
+      planValue = finalData.error ? null : safeJson(finalData.json?.choices?.[0]?.message?.content);
     }
   }
 
-  if (!finalData || finalData.error) {
+  if (!finalData || finalData.error || !planValue || !Array.isArray(planValue.findings)) {
     const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, PLAN_FINAL_MAX_TOKENS);
     const finalMessages = fitMessagesToTokenBudget(rawFinalMessages, GROQ_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS);
     const finalPayload = {
@@ -449,34 +471,29 @@ async function assessFloorplan(converted, env, apiKey) {
       response_format: PLAN_RESPONSE_FORMAT,
     };
     finalData = await callGroq(apiKey, finalPayload);
+    planValue = finalData.error ? null : safeJson(finalData.json?.choices?.[0]?.message?.content);
     // One reinforced retry on a schema-validation miss, mirroring the vision
     // path. Without this a single malformed generation discarded an otherwise
     // complete assessment and surfaced as "provider did not return an assessment".
-    if (finalData.error && finalData.code === 'json_validate_failed') {
+    if (!finalData.error && (!planValue || !Array.isArray(planValue.findings))) {
       // The usual cause is the generation being cut off mid-object, so the retry
       // both asks for a compact answer and raises the completion room rather than
       // repeating the same budget that truncated.
       finalData = await callGroq(apiKey, {
         ...finalPayload,
         max_completion_tokens: PLAN_FINAL_MAX_TOKENS + 400,
-        messages: [...finalMessages, {
-          role: 'user',
-          content: 'Your previous reply failed schema validation, most likely because it was cut '
-            + 'off. Return exactly one COMPLETE JSON object with every required field present. '
-            + 'Keep it compact: at most six findings and short rationales. Use null (not a missing '
-            + 'field) for clauseId or page when a finding has no clause to cite.',
-        }],
+        messages: [...finalMessages, planShapeRetryMessage('schema')],
       });
+      planValue = finalData.error ? null : safeJson(finalData.json?.choices?.[0]?.message?.content);
     }
   }
   if (finalData.error) return finalData;
-  const value = safeJson(finalData.json?.choices?.[0]?.message?.content);
-  if (!value || !Array.isArray(value.findings)) {
+  if (!planValue || !Array.isArray(planValue.findings)) {
     return { error: 'The reasoning provider returned an invalid plan assessment', status: 502, headers: {} };
   }
   // Forward the provider's own remaining-quota numbers so the client can pace
   // its *next* Groq-dependent call instead of guessing a fixed delay.
-  return { value: finalisePlanAssessment(value, plan), headers: finalData.headers };
+  return { value: finalisePlanAssessment(planValue, plan), headers: finalData.headers };
 }
 
 // Shared by plan and site-audit scoring so "same findings -> same score" holds
@@ -1551,6 +1568,11 @@ const PLAN_REASON_SYSTEM =
   + 'stair, so treat an absent staircase entry as cannot_verify for vertical-egress checks, not as proof there '
   + 'is none. subcomponents entries are vision-advisory (confidence-scored, not deterministic) — cite them as '
   + 'observed evidence but do not treat a low-confidence entry as certain. '
+  + 'IMPORTANT: use wallIntersections/dimensions/subcomponents only as EVIDENCE inside the existing finding '
+  + 'fields (observed, rationale, measurementEvidence) — the output JSON schema is fixed and already given below; '
+  + 'never add a new top-level field (no "subcomponents", "geometricModel", "staircase", etc.) to your response, '
+  + 'and never omit a required field. A finding about the staircase is still just one more entry in "findings" '
+  + 'with a "check" like "Egress — staircase present", using the existing shape. '
   + 'Identify which fire-safety systems and life-safety checks this specific geometry implicates (exit count and '
   + 'width, travel distance, corridor width, compartmentation, detection/sprinkler coverage, refuge area, etc.), '
   + 'then use the query_nbc tool to fetch the exact NBCS requirement for each — including a specific measured '
