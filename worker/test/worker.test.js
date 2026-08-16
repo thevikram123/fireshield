@@ -72,6 +72,46 @@ test('the model picker switches to whichever pool actually has headroom', (t) =>
   assert.equal(pickAvailableModel(LIGHT, HEAVY, 900), LIGHT);
 });
 
+test('summariseToolLoop removes every tool_calls turn and its paired replies', () => {
+  const { summariseToolLoop } = __testing__;
+  const messages = [
+    { role: 'system', content: 'S' },
+    { role: 'user', content: 'context' },
+    {
+      role: 'assistant', content: '',
+      tool_calls: [{ id: 'c1', function: { name: 'query_nbc', arguments: JSON.stringify({ question: 'sprinkler coverage' }) } }],
+    },
+    { role: 'tool', tool_call_id: 'c1', content: 'sprinklers required above 15m' },
+    { role: 'assistant', content: '', tool_calls: [] }, // empty turn, no content, no tool call
+    {
+      role: 'assistant', content: '',
+      tool_calls: [{ id: 'c2', function: { name: 'query_nbc', arguments: JSON.stringify({ question: 'exit width' }) } }],
+    },
+    { role: 'tool', tool_call_id: 'c2', content: 'minimum 1000mm' },
+  ];
+  const { base, summary } = summariseToolLoop(messages);
+
+  // Nothing carrying tool_calls, and no orphaned tool replies, may remain —
+  // this is what a tool_choice:'none' call must never see.
+  assert.ok(!base.some((m) => Array.isArray(m.tool_calls) && m.tool_calls.length));
+  assert.ok(!base.some((m) => m.role === 'tool'));
+  assert.deepEqual(base, [{ role: 'system', content: 'S' }, { role: 'user', content: 'context' }]);
+
+  // What was learned must survive as plain text, not be silently discarded.
+  assert.match(summary, /sprinkler coverage/);
+  assert.match(summary, /sprinklers required above 15m/);
+  assert.match(summary, /exit width/);
+  assert.match(summary, /minimum 1000mm/);
+});
+
+test('summariseToolLoop on a loop that never called a tool changes nothing', () => {
+  const { summariseToolLoop } = __testing__;
+  const messages = [{ role: 'system', content: 'S' }, { role: 'user', content: 'context' }];
+  const { base, summary } = summariseToolLoop(messages);
+  assert.deepEqual(base, messages);
+  assert.equal(summary, '');
+});
+
 test('the token trimmer shrinks history without orphaning tool_call pairings', () => {
   const { fitMessagesToTokenBudget, estimateTokens } = __testing__;
   // A realistic blown-up tool loop: big context + several bulky NBC lookups.
@@ -294,8 +334,15 @@ test('plan compliance can query_nbc for a specific measured condition before con
   assert.equal(final.model, 'openai/gpt-oss-120b');
   assert.equal(final.tool_choice, 'none');
   assert.equal(final.response_format.type, 'json_schema');
-  // The tool result (even if empty) must have round-tripped back as a tool message.
-  assert.ok(final.messages.some((m) => m.role === 'tool'));
+  // No message reaching a tool_choice:'none' call may carry tool_calls —
+  // Groq rejected such a request live with tool_use_failed ("Tool choice is
+  // none, but model called a tool") even with no `tools` field present,
+  // apparently the model continuing the pattern from its own prior turn.
+  assert.ok(!final.messages.some((m) => Array.isArray(m.tool_calls) && m.tool_calls.length));
+  assert.ok(!final.messages.some((m) => m.role === 'tool'));
+  // What the lookup found must still reach the model, as a plain-text summary.
+  assert.ok(final.messages.some((m) => m.role === 'user' && String(m.content).includes('NBCS lookup results')));
+  assert.ok(final.messages.some((m) => String(m.content).includes('minimum corridor width')));
 });
 
 test('a non-approving Qwen advisory never strips the deterministic geometry', async (t) => {

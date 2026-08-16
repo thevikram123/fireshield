@@ -67,6 +67,40 @@ function messageTokens(message) {
 /// Message STRUCTURE is preserved (never drop an assistant message carrying
 /// tool_calls, or its matching tool replies — orphaned tool_call_ids are a
 /// hard API error). Instead the oldest tool results, which are bulky NBC
+/// Collapse a tool-calling loop into plain text before a tool_choice:'none'
+/// call. Observed live: Groq rejected the final call with tool_use_failed
+/// ("Tool choice is none, but model called a tool") even though that request
+/// carried no `tools` field at all — the model still attempted a tool call,
+/// apparently continuing the pattern from an earlier assistant turn still
+/// present in its own message history. Removing every tool_calls-bearing
+/// assistant turn (and its paired tool replies) from the context the final
+/// call sees removes the pattern to continue, regardless of the exact cause;
+/// what was learned from those lookups is preserved as a plain-text summary
+/// so the verdict is still grounded in them.
+function summariseToolLoop(messages) {
+  const base = [];
+  const findings = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      const args = message.tool_calls.map((call) => {
+        try { return JSON.parse(call.function?.arguments || '{}'); } catch { return {}; }
+      });
+      let index = 0;
+      while (i + 1 < messages.length && messages[i + 1].role === 'tool') {
+        i++;
+        const question = String(args[index]?.question || args[index]?.seed_terms || '(lookup)');
+        findings.push(`Q: ${question.slice(0, 200)}\nA: ${String(messages[i].content || '').slice(0, 800)}`);
+        index++;
+      }
+      continue; // drop the assistant tool_calls turn itself
+    }
+    if (message.role === 'assistant' && !(message.content || '').trim()) continue; // empty turn, nothing to keep
+    base.push(message);
+  }
+  return { base, summary: findings.join('\n\n') };
+}
+
 /// lookups already reflected in later reasoning, get truncated first.
 function fitMessagesToTokenBudget(messages, maxInputTokens) {
   const fitted = messages.map((message) => ({ ...message }));
@@ -327,11 +361,16 @@ async function assessFloorplan(converted, env, apiKey) {
   // the one currently tight. Both models support JSON Schema Mode and tool
   // use (per their Groq model pages), so either can serve any step here.
   const finalModel = pickAvailableModel(env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, PLAN_FINAL_MAX_TOKENS);
+  const { base: planBase, summary: planFindings } = summariseToolLoop(messages);
   const finalMessages = fitMessagesToTokenBudget(
-    [...messages, {
-      role: 'user',
-      content: 'Now output the final compliance assessment as JSON only, matching the schema.',
-    }],
+    [
+      ...planBase,
+      {
+        role: 'user',
+        content: (planFindings ? `NBCS lookup results:\n${planFindings}\n\n` : '')
+          + 'Now output the final compliance assessment as JSON only, matching the schema.',
+      },
+    ],
     GROQ_TPM_BUDGET - PLAN_FINAL_MAX_TOKENS,
   );
   const finalPayload = {
@@ -867,10 +906,17 @@ async function groqReason(request, env, cors, apiKey) {
   // still answer (degraded, but real, beats a hard 429 mid-demo).
   const finalModel = pickAvailableModel(
     env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, REASON_FINAL_MAX_TOKENS);
+  const { base: reasonBase, summary: reasonFindings } = summariseToolLoop(messages);
   const finalData = await callGroq(apiKey, {
     model: finalModel,
     messages: fitMessagesToTokenBudget(
-      [...messages, { role: 'user', content: FINAL_INSTRUCTION }],
+      [
+        ...reasonBase,
+        {
+          role: 'user',
+          content: (reasonFindings ? `NBCS lookup results:\n${reasonFindings}\n\n` : '') + FINAL_INSTRUCTION,
+        },
+      ],
       GROQ_TPM_BUDGET - REASON_FINAL_MAX_TOKENS,
     ),
     tool_choice: 'none',
@@ -908,10 +954,11 @@ async function nbcQueryRoute(request, env, cors) {
 }
 
 // ── Groq call helper ─────────────────────────────────────────────────────────
-// Groq's TPM cooldowns run to ~45s, and a wait that returns a real assessment
-// beats surfacing a rate-limit error to the user. Capped below the Worker's
-// own request timeout so the wait can never outlive the request.
-const MAX_RATE_LIMIT_WAIT_MS = 50_000;
+// A plan assessment now completes in 8-9s in normal conditions (down from
+// ~45s+ before the single-hop change) — a 50s wait ceiling on a 429 would
+// have reintroduced exactly that near-minute latency on any collision. Kept
+// short enough to absorb a brief overlap without becoming the slow path.
+const MAX_RATE_LIMIT_WAIT_MS = 12_000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1280,5 +1327,5 @@ function json(value, status, headers = {}) {
 // through the full HTTP+mock-fetch machinery (and without leaking state into
 // unrelated tests in the same process).
 export const __testing__ = {
-  pickAvailableModel, groqQuota, fitMessagesToTokenBudget, estimateTokens,
+  pickAvailableModel, groqQuota, fitMessagesToTokenBudget, estimateTokens, summariseToolLoop,
 };
