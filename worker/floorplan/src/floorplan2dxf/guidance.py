@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -109,17 +110,6 @@ class QwenTopologyGuide:
             "refuge areas, compartments and exits. Preserve exact visible labels. Do not assume residential "
             "space types or invent features from the building profile. Include only structural walls, not "
             "furniture, dimension lines, text underlines, or room contents. "
-            'Also read every printed dimension label so real-world measurements can be recovered (EasyOCR is '
-            'not available at runtime, so this vision read is the only source for it). Return '
-            '"dimensions":[{"value_m":number,"orientation":"horizontal|vertical","position":[x,y]}] — one '
-            'entry per printed dimension number along the dimension lines (e.g. each segment like "2.00", '
-            '"4.00", "3.00" on a wall run, not just the overall total). "position" is the pixel location of '
-            'that label, placed near the wall segment it measures. "orientation" is horizontal for a '
-            'width/length label, vertical for a height/depth label. Convert feet/inches labels to metres. '
-            'Read as many dimension labels as are legibly printed; omit ones you cannot read confidently. Also '
-            'return "overall_width_m":number,"overall_height_m":number set to the printed OUTER envelope '
-            'dimension labels in metres (the outermost total, not a single room). Set both to 0 if no explicit '
-            'overall total is printed — never estimate or guess a value. '
             f"image_size=[{width},{height}]. Building profile context="
             + json.dumps(self.building_profile)
         )
@@ -129,6 +119,48 @@ class QwenTopologyGuide:
         self.audit.specification_confidence = _bounded_confidence(self.plan_spec.get("confidence", 0))
         self.audit.specification_summary = str(self.plan_spec.get("summary", ""))[:500]
         return self.plan_spec
+
+    def read_dimensions(self, rgb: np.ndarray) -> dict:
+        """A second, small, focused call: read printed dimension labels only.
+
+        Split out from specify() deliberately. That call already has to
+        enumerate spaces, walls, openings (with connectivity) and elements —
+        asking it to ALSO transcribe every printed dimension number competed
+        for the same completion budget and lost: dimensions/overall_width_m/
+        height_m sat last in a long prompt and a long response, and were
+        observed live to never actually arrive (scale stayed unrecovered call
+        after call) while even openings quality regressed once this was added
+        to the same request. A dedicated call has nothing else to do, so it
+        can give this its full, small budget instead of the tail end of a
+        crowded one. EasyOCR is disabled at runtime (Render memory limit), so
+        this is the only source for printed dimensions.
+        """
+        height, width = rgb.shape[:2]
+        # A compact line per dimension, not JSON: no repeated field names to
+        # pay for on every one of a plan's 10-20 labels. Format is exactly
+        # "<value_m> <H|V> <x> <y>", one per line, e.g. "2.00 H 219 162" for a
+        # horizontal 2.00m label centred at pixel (219,162). Blank/unreadable
+        # lines are simply omitted.
+        prompt = (
+            "Read every printed dimension label on this floor-plan drawing. Output ONLY plain text lines "
+            "in this exact format, nothing else — no JSON, no markdown, no explanation:\n"
+            "<value_m> <H|V> <x> <y>\n"
+            "One line per printed number along a dimension line — each individual segment (e.g. \"2.00\", "
+            "\"4.00\", \"3.00\" drawn along one wall run), not only the outermost total. value_m is the "
+            "number converted to metres (convert feet/inches). H means it labels a horizontal (width/length) "
+            "run, V a vertical (height/depth) run. x y is the pixel position of that label, near the wall "
+            "segment it measures. Read as many as are legibly printed; omit any you cannot read confidently "
+            "— never guess a value. "
+            "After all dimension lines, add exactly one final line for the printed OUTER envelope total for "
+            "the whole building (not a single room): \"OVERALL <width_m> <height_m>\". If no explicit overall "
+            "total is printed, write \"OVERALL 0 0\".\n"
+            "Example output:\n2.00 H 219 162\n4.00 H 420 162\n8.00 V 68 550\nOVERALL 9.00 11.00\n"
+            f"image_size=[{width},{height}]."
+        )
+        try:
+            return _qwen_dimension_lines(self.api_key, self.model, rgb, prompt, max_tokens=900)
+        except Exception:  # noqa: BLE001 - scale recovery is best-effort, never fatal
+            return {}
 
     def _capture_review(self, payload: dict, initial: bool) -> None:
         review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
@@ -318,13 +350,48 @@ def _downscale_for_vision(rgb: np.ndarray, max_side: int = QWEN_MAX_SIDE) -> np.
     )
 
 
+def _qwen_request(
+    api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int,
+    response_format: dict | None,
+) -> str:
+    """Encode the image and image+prompt, return the raw text content."""
+    rgb = _downscale_for_vision(rgb)
+    ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not ok:
+        raise RuntimeError("could not encode plan image")
+    image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]}],
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "presence_penalty": 1.5,
+        "max_completion_tokens": max_tokens,
+        "reasoning_effort": "none",
+        "stream": False,
+    }
+    if response_format is not None:
+        payload["response_format"] = response_format
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "FireShield-Floorplan/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as response:
+        result = json.load(response)
+    return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
 def _qwen_json(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
-        rgb = _downscale_for_vision(rgb)
-        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 82])
-        if not ok:
-            raise RuntimeError("could not encode plan image")
-        image_url = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
-        result = None
         for attempt in range(2):
             attempt_prompt = prompt
             if attempt:
@@ -332,45 +399,63 @@ def _qwen_json(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_token
                     " Previous generation failed JSON validation. Return exactly one complete JSON object "
                     "matching the requested keys, with no markdown, comments, or trailing text."
                 )
-            body = json.dumps({
-                "model": model,
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": attempt_prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]}],
-                "temperature": 0.7,
-                "top_p": 0.8,
-                "presence_penalty": 1.5,
-                "max_completion_tokens": max_tokens,
-                "reasoning_effort": "none",
-                "response_format": {"type": "json_object"},
-                "stream": False,
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                "https://api.groq.com/openai/v1/chat/completions",
-                data=body,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "User-Agent": "FireShield-Floorplan/1.0",
-                },
-                method="POST",
-            )
             try:
-                with urllib.request.urlopen(req, timeout=60) as response:
-                    result = json.load(response)
-                break
+                content = _qwen_request(
+                    api_key, model, rgb, attempt_prompt, max_tokens, {"type": "json_object"})
+                return json.loads(content or "{}")
             except urllib.error.HTTPError as exc:
                 provider_code, provider_message = _provider_error_details(exc)
                 if exc.code == 400 and provider_code == "json_validate_failed" and attempt == 0:
                     continue
                 suffix = f": {provider_message}" if provider_message else ""
                 raise RuntimeError(f"Qwen request failed ({exc.code}){suffix}") from exc
-        if result is None:
-            raise RuntimeError("Qwen request failed after JSON validation retry")
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-        return json.loads(content)
+            except json.JSONDecodeError:
+                if attempt == 0:
+                    continue
+                raise RuntimeError("Qwen request failed after JSON validation retry")
+        raise RuntimeError("Qwen request failed after JSON validation retry")
+
+
+#: Matches one compact dimension line: "2.00 H 219 162" (value, orientation
+#: letter, x, y). Whitespace-tolerant; unrecognised lines are simply skipped
+#: rather than failing the whole read, so partial output is never wasted.
+_DIMENSION_LINE = re.compile(
+    r"^\s*(?P<value>\d+(?:\.\d+)?)\s+(?P<axis>[HhVv])\s+(?P<x>-?\d+(?:\.\d+)?)\s+(?P<y>-?\d+(?:\.\d+)?)\s*$"
+)
+_OVERALL_LINE = re.compile(
+    r"^\s*OVERALL\s+(?P<w>\d+(?:\.\d+)?)\s+(?P<h>\d+(?:\.\d+)?)\s*$", re.IGNORECASE
+)
+
+
+def _qwen_dimension_lines(api_key: str, model: str, rgb: np.ndarray, prompt: str, max_tokens: int) -> dict:
+    """Read a compact line-based format instead of JSON.
+
+    Repeating JSON's field names ("value_m", "orientation", "position") for
+    every one of a plan's 10-20 printed dimensions is what competed the
+    dimension read out of its token budget in the combined call. A plain line
+    per dimension carries the same information in roughly a fifth the
+    characters, which both fits far more of them in the same completion
+    budget and, since output tokens are what the daily quota bills, costs
+    less per call outright. No JSON-repair retry is needed: unparseable lines
+    are just skipped, so a partially malformed reply still yields whatever it
+    got right instead of being discarded entirely.
+    """
+    text = _qwen_request(api_key, model, rgb, prompt, max_tokens, response_format=None)
+    dimensions: list[dict] = []
+    overall_w = overall_h = 0.0
+    for line in text.splitlines():
+        dim_match = _DIMENSION_LINE.match(line)
+        if dim_match:
+            dimensions.append({
+                "value_m": float(dim_match.group("value")),
+                "orientation": "horizontal" if dim_match.group("axis").upper() == "H" else "vertical",
+                "position": [float(dim_match.group("x")), float(dim_match.group("y"))],
+            })
+            continue
+        overall_match = _OVERALL_LINE.match(line)
+        if overall_match:
+            overall_w, overall_h = float(overall_match.group("w")), float(overall_match.group("h"))
+    return {"dimensions": dimensions, "overall_width_m": overall_w, "overall_height_m": overall_h}
 
 
 def _bounded_confidence(value) -> float:
