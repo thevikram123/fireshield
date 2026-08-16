@@ -540,85 +540,40 @@ test('groqReason uses Mistral as primary when MISTRAL_API_KEY is configured and 
   assert.ok(mistralPayload.messages.some((m) => String(m.content).includes('Tool calling is now disabled')));
 });
 
-test('groqReason falls back to Groq when MISTRAL_API_KEY is configured but Mistral fails', async (t) => {
+test('groqReason returns an explicit error when Mistral fails outright — no Groq fallback for the final verdict', async (t) => {
+  // Per explicit instruction: the final verdict call is Mistral-only now.
+  // A genuine outage (500, not a generation-validation failure) is not
+  // retried and must not silently fall through to Groq.
   const seenUrls = [];
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     seenUrls.push(String(url));
-
     if (String(url).includes('api.mistral.ai')) {
       return new Response(JSON.stringify({ error: { message: 'Mistral internal error' } }), {
         status: 500,
         headers: {},
       });
     }
-
-    if (String(url).includes('api.groq.com')) {
-      const payload = JSON.parse(options.body);
-      if (payload.tool_choice === 'none') {
-        return Response.json({
-          choices: [{
-            message: {
-              content: JSON.stringify({
-                occupancySummary: 'Business occupancy (Groq fallback)',
-                score: 85,
-                findings: [{
-                  system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
-                  observed: '2 extinguishers observed', required: 'per clause', clauseId: '', page: null,
-                  rationale: 'meets requirement',
-                }],
-                citedClauses: []
-              })
-            }
-          }]
-        });
-      }
-      return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
-    }
-    return Response.json({});
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
   });
 
   const response = await worker.fetch(
     post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
-    env({
-      MISTRAL_API_KEY: 'test-mistral-key',
-    }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
   );
 
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 500);
   const body = await response.json();
-  assert.equal(body.occupancySummary, 'Business occupancy (Groq fallback)');
-  assert.equal(body.score, 100);
-
-  assert.ok(seenUrls.includes('https://api.mistral.ai/v1/chat/completions'), 'Mistral should have been tried');
-  const groqCalls = seenUrls.filter(u => u.includes('api.groq.com'));
-  assert.equal(groqCalls.length, 2, 'Should call Groq twice (1 tool hop + 1 fallback verdict)');
+  assert.ok(body.error.includes('Mistral call failed'));
+  const mistralCalls = seenUrls.filter((u) => u.includes('api.mistral.ai'));
+  assert.equal(mistralCalls.length, 1, 'a genuine 500 is not retried');
 });
 
-test('groqReason goes straight to Groq when MISTRAL_API_KEY is not configured', async (t) => {
-  const seenUrls = [];
+test('groqReason returns an explicit error when MISTRAL_API_KEY is not configured, without ever calling Groq for the verdict', async (t) => {
+  let groqFinalCalled = false;
   t.mock.method(globalThis, 'fetch', async (url, options) => {
-    seenUrls.push(String(url));
-
     if (String(url).includes('api.groq.com')) {
       const payload = JSON.parse(options.body);
-      if (payload.tool_choice === 'none') {
-        return Response.json({
-          choices: [{
-            message: {
-              content: JSON.stringify({
-                occupancySummary: 'Business occupancy (Groq straight)',
-                score: 80,
-                findings: [{
-                  system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
-                  observed: '2 extinguishers observed', required: 'per clause', clauseId: '', page: null,
-                  rationale: 'meets requirement',
-                }],
-                citedClauses: []
-              })
-            }
-          }]
-        });
-      }
+      if (payload.tool_choice === 'none') groqFinalCalled = true;
       return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
     }
     return Response.json({});
@@ -629,14 +584,48 @@ test('groqReason goes straight to Groq when MISTRAL_API_KEY is not configured', 
     env(),
   );
 
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 502);
   const body = await response.json();
-  assert.equal(body.occupancySummary, 'Business occupancy (Groq straight)');
-  assert.equal(body.score, 100);
+  assert.ok(body.error.includes('Mistral is not configured'));
+  assert.equal(groqFinalCalled, false, 'the final verdict must never fall back to Groq');
+});
 
-  assert.ok(!seenUrls.includes('https://api.mistral.ai/v1/chat/completions'), 'Mistral should not be called');
-  const groqCalls = seenUrls.filter(u => u.includes('api.groq.com'));
-  assert.equal(groqCalls.length, 2, 'Should call Groq twice');
+test('a Groq/Mistral-style 400 generation-validation failure ("json_validate_failed") IS retried, not surfaced immediately', async (t) => {
+  // Live-observed bug: the corrective retry only fired when a provider
+  // answered 200 with a bad shape, never when the provider's OWN api
+  // rejected the call with a 400 generation failure — so this exact error
+  // used to reach the client on the very first attempt with zero retry.
+  let mistralFinalCalls = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (String(url).includes('api.mistral.ai')) {
+      mistralFinalCalls++;
+      if (mistralFinalCalls === 1) {
+        return new Response(JSON.stringify({
+          error: { message: 'Failed to generate JSON. Please adjust your prompt.', code: 'json_validate_failed' },
+        }), { status: 400, headers: {} });
+      }
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        occupancySummary: 'Recovered on retry', score: 0,
+        findings: [{
+          system: 'Fire Extinguisher', status: 'compliant', severity: 'minor',
+          observed: '2 extinguishers observed', required: 'per clause', clauseId: '', page: null,
+          rationale: 'meets requirement',
+        }],
+        citedClauses: [],
+      }) } }] });
+    }
+    return Response.json({ choices: [{ message: { content: 'no tools', tool_calls: [] } }] });
+  });
+
+  const response = await worker.fetch(
+    post('/groq/reason', { buildingProfile: {}, detected: [], docs: [] }),
+    env({ MISTRAL_API_KEY: 'test-mistral-key' }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(mistralFinalCalls, 2, 'the generation failure must trigger exactly one corrective retry');
+  const body = await response.json();
+  assert.equal(body.occupancySummary, 'Recovered on retry');
 });
 
 test('a 429 on the tool-selection hop degrades to the final verdict instead of failing the request', async (t) => {
@@ -689,26 +678,22 @@ test('a 429 on the tool-selection hop degrades to the final verdict instead of f
   assert.equal(body.occupancySummary, 'Answered despite the hop failing');
 });
 
-test('an empty-findings ("incompatible json") final reply is retried once, then falls back to Groq', async (t) => {
-  // Live-observed: a provider answered HTTP 200 with a shape that didn't
-  // match what the client needs (empty/malformed findings) and that garbage
-  // was returned to the client as a 200. Mistral now gets one corrective
-  // retry, and if it still comes back broken, Groq is tried as a fresh
-  // attempt (not just left to inherit Mistral's failure).
+test('an empty-findings ("incompatible json") final reply is retried once on Mistral and can recover', async (t) => {
+  // Live-observed: Mistral answered HTTP 200 with a shape that didn't match
+  // what the client needs (empty/malformed findings) and that garbage was
+  // returned to the client as a 200. Mistral now gets one corrective retry
+  // (same provider — there is no Groq fallback for this call).
   let mistralFinalCalls = 0;
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     if (String(url).includes('api.mistral.ai')) {
       mistralFinalCalls++;
-      // Every Mistral attempt (including the corrective retry) comes back
-      // with an empty findings array — permanently malformed for this provider.
+      if (mistralFinalCalls === 1) {
+        return Response.json({ choices: [{ message: { content: JSON.stringify({
+          occupancySummary: 'Broken Mistral reply', score: 40, findings: [], citedClauses: [],
+        }) } }] });
+      }
       return Response.json({ choices: [{ message: { content: JSON.stringify({
-        occupancySummary: 'Broken Mistral reply', score: 40, findings: [], citedClauses: [],
-      }) } }] });
-    }
-    const payload = JSON.parse(options.body);
-    if (payload.tool_choice === 'none') {
-      return Response.json({ choices: [{ message: { content: JSON.stringify({
-        occupancySummary: 'Groq recovered the audit', score: 20,
+        occupancySummary: 'Mistral recovered on retry', score: 20,
         findings: [{
           system: 'Sprinkler System', status: 'critical_gap', severity: 'critical',
           observed: 'No sprinkler heads detected', required: 'mandatory coverage', clauseId: '', page: null,
@@ -728,11 +713,11 @@ test('an empty-findings ("incompatible json") final reply is retried once, then 
   assert.equal(response.status, 200);
   assert.equal(mistralFinalCalls, 2, 'Mistral gets exactly one corrective retry before giving up');
   const body = await response.json();
-  assert.equal(body.occupancySummary, 'Groq recovered the audit');
+  assert.equal(body.occupancySummary, 'Mistral recovered on retry');
   assert.equal(body.score, 0);
 });
 
-test('a final reply that stays malformed on every provider returns an explicit error, never fabricated 200 content', async (t) => {
+test('a final reply that stays malformed on both Mistral attempts returns an explicit error, never fabricated 200 content', async (t) => {
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     if (String(url).includes('api.mistral.ai')) {
       return Response.json({ choices: [{ message: { content: JSON.stringify({

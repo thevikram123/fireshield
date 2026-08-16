@@ -878,9 +878,17 @@ async function groqReason(request, env, cors, apiKey) {
   // nodes and the model correctly (but unhelpfully) marked everything
   // cannot_verify. Folding the building's own occupancy/height/area into the
   // query is what actually finds the row that applies to THIS building.
-  const occupancyHint = [profile.occupancy, profile.heightM ? `${profile.heightM}m height` : '',
-    profile.floorAreaSqm ? `${profile.floorAreaSqm} sqm` : '']
-    .filter(Boolean).join(' ');
+  // `profile.occupancy` alone is the broad taxonomy GROUP name (e.g.
+  // "Institutional" for Group C) — it never contains the specific word
+  // ("Hospital") that Table 7C's own label uses, so a hint built from it
+  // alone still missed the row live. buildingType/subdivisionName carry that
+  // specific word; floorAreaSqm/areaM2 covers both field names the app has
+  // used for area across this project's history.
+  const occupancyHint = [
+    profile.buildingType, profile.subdivisionName, profile.occupancy,
+    profile.heightM ? `${profile.heightM}m height` : '',
+    (profile.floorAreaSqm ?? profile.areaM2) ? `${profile.floorAreaSqm ?? profile.areaM2} sqm` : '',
+  ].filter(Boolean).join(' ');
   const observedGuidance = await Promise.all(observedTypes.map(async (type) => {
     try {
       const query = occupancyHint
@@ -980,8 +988,16 @@ async function groqReason(request, env, cors, apiKey) {
   }
 
   // Force a final structured verdict grounded in the tool results.
-  // Using Mistral as the primary model to avoid Groq's 429 TPM limits,
-  // falling back to Groq if Mistral is not configured or fails.
+  // Mistral only, per explicit instruction — no Groq fallback for this call
+  // (the tool-hop grounding loop above still uses both). Groq's own free-tier
+  // TPM pool being this call's fallback meant a Mistral failure just handed
+  // the request to an ALSO-frequently-exhausted pool instead of actually
+  // recovering, and a shared Groq generation-validation failure could hit
+  // both attempts back to back.
+  if (!mistralKey) {
+    return json({ error: 'Mistral is not configured (MISTRAL_API_KEY missing) — the final '
+      + 'compliance verdict has no provider to run on.' }, 502, cors);
+  }
   const { base: reasonBase, summary: reasonFindings } = summariseToolLoop(messages);
   const rawFinalMessages = [
     ...reasonBase,
@@ -993,12 +1009,12 @@ async function groqReason(request, env, cors, apiKey) {
   const shapeRetryMessages = (msgs) => [...msgs, {
     role: 'user',
     content: 'Your previous reply did not match the required JSON shape (missing/empty '
-      + '"findings", or a finding missing a valid "status" or "severity" enum value). Return '
-      + 'the SAME assessment again, corrected to match the shape exactly.',
+      + '"findings", a finding missing a valid "status"/"severity" enum value, or the JSON '
+      + 'itself was truncated/malformed). Return the SAME assessment again as one complete, '
+      + 'valid JSON object matching the shape exactly — keep it compact if you were cut off.',
   }];
 
   async function callMistralFinal(msgs) {
-    if (!mistralKey) return null;
     return callMistral(mistralKey, {
       model: 'mistral-medium-latest',
       messages: fitMessagesToTokenBudget(msgs, MISTRAL_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
@@ -1009,39 +1025,28 @@ async function groqReason(request, env, cors, apiKey) {
       response_format: { type: 'json_object' },
     });
   }
-  async function callGroqFinal(msgs) {
-    const finalModel = pickAvailableModel(
-      env.GROQ_REASON_MODEL, env.GROQ_LIGHT_MODEL, REASON_FINAL_MAX_TOKENS);
-    return callGroq(apiKey, {
-      model: finalModel,
-      messages: fitMessagesToTokenBudget(msgs, GROQ_TPM_BUDGET - REASON_FINAL_MAX_TOKENS),
-      tool_choice: 'none',
-      temperature: 0.2,
-      max_completion_tokens: REASON_FINAL_MAX_TOKENS,
-      include_reasoning: false,
-      response_format: { type: 'json_object' },
-    });
-  }
-  // Try one provider, and if it answers but with a malformed/incompatible
-  // shape, give it exactly one corrective retry before giving up on it — this
-  // is what was missing: a provider returning HTTP 200 with a broken shape
-  // was previously returned to the client as-is (the "incompatible json"
-  // symptom), instead of being caught and retried or handed to the fallback.
+  // Retry once, correcting for EITHER failure mode: (a) the call itself
+  // errored because the provider's own generation/validation rejected the
+  // output (e.g. Groq/Mistral "failed to generate JSON" / truncated output —
+  // this used to skip the retry entirely and surface the raw provider error
+  // to the client), or (b) the call succeeded (200) but the parsed JSON didn't
+  // match our shape (the "incompatible json" symptom). A genuine outage
+  // (429/5xx/auth) is not retried here — callMistral already retries once on
+  // 429 internally, and re-asking won't fix an auth/5xx failure.
   async function attempt(callFn, msgs) {
     let data = await callFn(msgs);
-    if (!data || data.error) return { data, verdict: null };
-    let verdict = safeJson(data.json?.choices?.[0]?.message?.content);
+    let verdict = (!data || data.error) ? null : safeJson(data.json?.choices?.[0]?.message?.content);
     if (isValidVerdict(verdict)) return { data, verdict };
+    const isRetryableGenerationFailure = data?.error
+      && data.status === 400
+      && /json_validate_failed|failed to generate json/i.test(`${data.code} ${data.error}`);
+    if (data?.error && !isRetryableGenerationFailure) return { data, verdict: null };
     data = await callFn(shapeRetryMessages(msgs));
-    if (!data || data.error) return { data, verdict: null };
-    verdict = safeJson(data.json?.choices?.[0]?.message?.content);
+    verdict = (!data || data.error) ? null : safeJson(data.json?.choices?.[0]?.message?.content);
     return { data, verdict: isValidVerdict(verdict) ? verdict : null };
   }
 
-  let { data: finalData, verdict } = await attempt(callMistralFinal, rawFinalMessages);
-  if (!verdict) {
-    ({ data: finalData, verdict } = await attempt(callGroqFinal, rawFinalMessages));
-  }
+  const { data: finalData, verdict } = await attempt(callMistralFinal, rawFinalMessages);
 
   if (!finalData || finalData.error) {
     return json({ error: finalData?.error || 'reasoning call failed', retryAfterSeconds: finalData?.retryAfterSeconds ?? null },
@@ -1284,11 +1289,16 @@ const REASON_SYSTEM =
   + 'Qwen condition notes may be used as observations but not as measurements or certificates. '
   + 'For every observed equipment class, query the applicable inspection/placement guidance. '
   + 'Table 7/7C-style protection-level tables are occupancy- and height-specific '
-  + '(e.g. "Table 7C Hospital CL-4: Height not exceeding 45 m... Spr R") — always include the '
-  + 'building\'s occupancy classification and height/area in your query_nbc question '
-  + '(e.g. "Table 7 sprinkler requirement for Group C Hospital, height 22m, 4500 sqm"), not just '
-  + 'the system name, or you will only find generic definitions instead of the row that applies '
-  + 'to this building. Cite the clause id and page from '
+  + '(e.g. "Table 7C Hospital CL-4: Height not exceeding 45 m... Spr R"). The buildingProfile '
+  + '`occupancy` field is only the broad taxonomy GROUP name (e.g. "Institutional") — it will '
+  + 'NOT match a table row. Always use `buildingType` and/or `subdivisionName` instead (e.g. '
+  + '"Hospital", "Hospitals and sanatoria") together with height/area in your query_nbc question '
+  + '(e.g. "Table 7 sprinkler requirement for Hospital, height 22m, 4500 sqm"), not the generic '
+  + 'occupancy group and not just the system name, or you will only find generic definitions or an '
+  + 'unrelated standard (like an IS number for a different technology) instead of the row that '
+  + 'applies to this building. If your first query_nbc for a system returns only generic/IS-number '
+  + 'results with no explicit count or table row, retry that same system with "Table 7" explicitly '
+  + 'in the question before giving up and marking it cannot_verify. Cite the clause id and page from '
   + 'the tool results. Call query_nbc once per system before concluding. '
   + 'If the evidence is broken into a `zones` array (each with its own label/level/floorAreaSqm '
   + 'and detected equipment, from separate areas of the same building), evaluate spacing- and '

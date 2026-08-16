@@ -18,11 +18,21 @@
   },
 
   // Reuse the existing GROQ_API_KEY already in this account's Secrets Store.
+  // MISTRAL_API_KEY moved here too (2026-08-16) — the plain `wrangler secret
+  // put` version kept getting a UTF-8 BOM prepended by the PowerShell pipe
+  // used to set it, corrupting the Authorization header and causing silent
+  // 401s. Set via the dashboard's Secrets Store UI instead, which has no
+  // such encoding pitfall.
   "secrets_store_secrets": [
     {
       "binding": "GROQ_API_KEY",
       "store_id": "e0660ebafc5e4cc99716ab5d12e72d6f",
       "secret_name": "GROQ_API_KEY"
+    },
+    {
+      "binding": "MISTRAL_API_KEY",
+      "store_id": "e0660ebafc5e4cc99716ab5d12e72d6f",
+      "secret_name": "MISTRAL_API_KEY"
     }
   ],
 
